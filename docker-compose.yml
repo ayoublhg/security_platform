@@ -1,0 +1,180 @@
+version: '3.8'
+
+services:
+  # Person A's Services
+  orchestrator:
+    build: ./platform/orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:secure_password@postgres:5432/security_platform
+      - REDIS_URL=redis://redis:6379
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITLAB_TOKEN=${GITLAB_TOKEN}
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - scan-data:/tmp/scans
+    networks:
+      - security-network
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+
+  api-gateway:
+    build: ./platform/api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET}
+    depends_on:
+      - redis
+    networks:
+      - security-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  kubernetes-operator:
+    build: ./platform/kubernetes-operator
+    environment:
+      - PLATFORM_API=http://orchestrator:8000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.kube/config:/root/.kube/config
+    networks:
+      - security-network
+
+  # Person B's Services
+  vuln-database:
+    build: ./security/vuln-database
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql://postgres:secure_password@postgres:5432/security_platform
+      - REDIS_URL=redis://redis:6379
+      - NVD_API_KEY=${NVD_API_KEY}
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - security-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  compliance-mapper:
+    build: ./security/compliance-mapper
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql://postgres:secure_password@postgres:5432/security_platform
+    depends_on:
+      - postgres
+    networks:
+      - security-network
+
+  auto-remediation:
+    build: ./security/auto-remediation
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - JIRA_URL=${JIRA_URL}
+      - JIRA_USER=${JIRA_USER}
+      - JIRA_TOKEN=${JIRA_TOKEN}
+      - SLACK_TOKEN=${SLACK_TOKEN}
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - security-network
+
+  # Shared Services
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=secure_password
+      - POSTGRES_DB=security_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./shared/models/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - security-network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - security-network
+    command: redis-server --appendonly yes
+
+  # Monitoring
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - security-network
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - security-network
+
+  # Dashboard
+  dashboard:
+    build: ./shared/dashboard
+    ports:
+      - "5000:5000"
+    environment:
+      - ORCHESTRATOR_API=http://orchestrator:8000
+      - COMPLIANCE_API=http://compliance-mapper:8002
+      - DATABASE_URL=postgresql://postgres:secure_password@postgres:5432/security_platform
+    depends_on:
+      - orchestrator
+      - compliance-mapper
+      - postgres
+    networks:
+      - security-network
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+  scan-data:
+
+networks:
+  security-network:
+    driver: bridge
