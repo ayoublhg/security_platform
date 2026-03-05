@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+*.log
+*.pid
+*.pid.lock
+
+# Docker
+*.pid
+*.sock
+
+# Sécurité
+*.pem
+*.key
+*.crt
+*.keystore
+
+# Données
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Reports
+reports/
+coverage/
+htmlcov/
+*.html
+*.xml
+*.json
+!sample-report.json
+
+# Tests
+.pytest_cache/
+.coverage
+.tox/

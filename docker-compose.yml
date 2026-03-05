@@ -1,64 +1,89 @@
-version: '3.8'
 
 services:
-  # Person A's Services
+  # ============ SERVICES DE BASE ============
+  postgres:
+    image: postgres:15-alpine
+    container_name: security-postgres
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-security_platform}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./shared/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - security-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: security-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - security-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ============ SERVICES PLATEFORME ============
   orchestrator:
     build: ./platform/orchestrator
+    container_name: security-orchestrator
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://postgres:secure_password@postgres:5432/security_platform
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - REDIS_URL=redis://redis:6379
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GITLAB_TOKEN=${GITLAB_TOKEN}
-    depends_on:
-      - postgres
-      - redis
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - scan-data:/tmp/scans
+      - ./reports:/app/reports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - security-network
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
+    restart: unless-stopped
 
   api-gateway:
     build: ./platform/api-gateway
+    container_name: security-api-gateway
     ports:
       - "8080:8080"
     environment:
+      - JWT_SECRET=${JWT_SECRET:-dev_secret_key_change_in_production}
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=${JWT_SECRET}
     depends_on:
       - redis
+      - orchestrator
     networks:
       - security-network
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 2G
+    restart: unless-stopped
 
-  kubernetes-operator:
-    build: ./platform/kubernetes-operator
-    environment:
-      - PLATFORM_API=http://orchestrator:8000
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ~/.kube/config:/root/.kube/config
-    networks:
-      - security-network
-
-  # Person B's Services
+  # ============ SERVICES SÉCURITÉ ============
   vuln-database:
     build: ./security/vuln-database
+    container_name: security-vuln-db
     ports:
       - "8001:8001"
     environment:
-      - DATABASE_URL=postgresql://postgres:secure_password@postgres:5432/security_platform
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - REDIS_URL=redis://redis:6379
       - NVD_API_KEY=${NVD_API_KEY}
     depends_on:
@@ -66,25 +91,24 @@ services:
       - redis
     networks:
       - security-network
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 2G
+    restart: unless-stopped
 
   compliance-mapper:
     build: ./security/compliance-mapper
+    container_name: security-compliance
     ports:
       - "8002:8002"
     environment:
-      - DATABASE_URL=postgresql://postgres:secure_password@postgres:5432/security_platform
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     depends_on:
       - postgres
     networks:
       - security-network
+    restart: unless-stopped
 
   auto-remediation:
     build: ./security/auto-remediation
+    container_name: security-remediation
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - JIRA_URL=${JIRA_URL}
@@ -96,40 +120,28 @@ services:
       - redis
     networks:
       - security-network
+    restart: unless-stopped
 
-  # Shared Services
-  postgres:
-    image: postgres:15-alpine
+  # ============ DASHBOARD ============
+  dashboard:
+    build: ./shared/dashboard
+    container_name: security-dashboard
+    ports:
+      - "5000:5000"
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=secure_password
-      - POSTGRES_DB=security_platform
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./shared/models/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - ORCHESTRATOR_API=http://orchestrator:8000
+    depends_on:
+      - postgres
+      - orchestrator
     networks:
       - security-network
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 2G
+    restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis-data:/data
-    networks:
-      - security-network
-    command: redis-server --appendonly yes
-
-  # Monitoring
+  # ============ MONITORING ============
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:latest
+    container_name: security-prometheus
     ports:
       - "9090:9090"
     volumes:
@@ -137,44 +149,30 @@ services:
       - prometheus-data:/prometheus
     networks:
       - security-network
+    restart: unless-stopped
 
   grafana:
-    image: grafana/grafana
+    image: grafana/grafana:latest
+    container_name: security-grafana
     ports:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
       - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
     depends_on:
       - prometheus
     networks:
       - security-network
+    restart: unless-stopped
 
-  # Dashboard
-  dashboard:
-    build: ./shared/dashboard
-    ports:
-      - "5000:5000"
-    environment:
-      - ORCHESTRATOR_API=http://orchestrator:8000
-      - COMPLIANCE_API=http://compliance-mapper:8002
-      - DATABASE_URL=postgresql://postgres:secure_password@postgres:5432/security_platform
-    depends_on:
-      - orchestrator
-      - compliance-mapper
-      - postgres
-    networks:
-      - security-network
+networks:
+  security-network:
+    driver: bridge
 
 volumes:
   postgres-data:
   redis-data:
   prometheus-data:
   grafana-data:
-  scan-data:
-
-networks:
-  security-network:
-    driver: bridge

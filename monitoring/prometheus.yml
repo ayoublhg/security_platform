@@ -2,38 +2,23 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: []
-
-rule_files:
-  - "alerts.yml"
-
 scrape_configs:
   - job_name: 'orchestrator'
     static_configs:
       - targets: ['orchestrator:8000']
-    metrics_path: '/metrics'
-
+  
   - job_name: 'api-gateway'
     static_configs:
       - targets: ['api-gateway:8080']
-    metrics_path: '/metrics'
-
+  
   - job_name: 'vuln-database'
     static_configs:
       - targets: ['vuln-database:8001']
-    metrics_path: '/metrics'
-
-  - job_name: 'postgres'
+  
+  - job_name: 'compliance-mapper'
     static_configs:
-      - targets: ['postgres:9187']  # Postgres exporter
-
-  - job_name: 'redis'
+      - targets: ['compliance-mapper:8002']
+  
+  - job_name: 'dashboard'
     static_configs:
-      - targets: ['redis:9121']  # Redis exporter
-
-  - job_name: 'node'
-    static_configs:
-      - targets: ['node-exporter:9100']
+      - targets: ['dashboard:5000']
