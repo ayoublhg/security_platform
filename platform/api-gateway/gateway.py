@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Enterprise API Gateway with Rate Limiting, Auth, and Monitoring
+Enterprise API Gateway with Rate Limiting, Auth, Monitoring, and Prometheus Metrics
 """
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import time
@@ -13,6 +13,36 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import logging
 import os
+
+# ============ PROMETHEUS METRICS ============
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
+
+# Métriques pour l'API Gateway
+http_requests_total = Counter(
+    'gateway_http_requests_total',
+    'Total HTTP requests',
+    ['method', 'endpoint', 'status_code']
+)
+
+http_request_duration_seconds = Histogram(
+    'gateway_http_request_duration_seconds',
+    'HTTP request duration in seconds',
+    ['method', 'endpoint'],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
+)
+
+rate_limiter_hits = Counter(
+    'gateway_rate_limiter_hits_total',
+    'Total rate limiter hits',
+    ['limit_type']
+)
+
+active_connections = Counter(
+    'gateway_active_connections',
+    'Active connections'
+)
+
+# ============ FIN PROMETHEUS ============
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,11 +69,12 @@ class RateLimiter:
         key = f"ratelimit:tenant:{tenant_id}"
         current = await self.redis.get(key)
         
-        if current and int(current) > 1000:  # 1000 requests per hour
+        if current and int(current) > 1000:
+            rate_limiter_hits.labels(limit_type='tenant').inc()
             return False
         
         await self.redis.incr(key)
-        await self.redis.expire(key, 3600)  # 1 hour
+        await self.redis.expire(key, 3600)
         return True
     
     async def check_ip_limit(self, ip: str) -> bool:
@@ -51,11 +82,12 @@ class RateLimiter:
         key = f"ratelimit:ip:{ip}"
         current = await self.redis.get(key)
         
-        if current and int(current) > 100:  # 100 requests per minute
+        if current and int(current) > 100:
+            rate_limiter_hits.labels(limit_type='ip').inc()
             return False
         
         await self.redis.incr(key)
-        await self.redis.expire(key, 60)  # 1 minute
+        await self.redis.expire(key, 60)
         return True
 
 class AuthMiddleware:
@@ -65,7 +97,6 @@ class AuthMiddleware:
         self.secret_key = os.getenv('JWT_SECRET', 'your-secret-key-change-in-production')
         self.algorithm = "HS256"
         
-        # Role-based permissions
         self.permissions = {
             'admin': ['create:scan', 'read:scan', 'delete:scan', 'manage:tenant'],
             'security_engineer': ['create:scan', 'read:scan'],
@@ -74,7 +105,6 @@ class AuthMiddleware:
         }
     
     def create_token(self, user_id: str, role: str, tenant_id: str) -> str:
-        """Create JWT token"""
         payload = {
             'user_id': user_id,
             'role': role,
@@ -84,7 +114,6 @@ class AuthMiddleware:
         return jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
     
     def verify_token(self, token: str) -> Dict:
-        """Verify and decode JWT token"""
         try:
             payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
             return payload
@@ -98,10 +127,35 @@ redis_client = None
 rate_limiter = None
 auth = AuthMiddleware()
 
+# Middleware pour les métriques
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """Middleware pour collecter les métriques Prometheus"""
+    start_time = time.time()
+    
+    active_connections.inc()
+    response = await call_next(request)
+    active_connections.dec()
+    
+    duration = time.time() - start_time
+    
+    http_requests_total.labels(
+        method=request.method,
+        endpoint=request.url.path,
+        status_code=response.status_code
+    ).inc()
+    
+    http_request_duration_seconds.labels(
+        method=request.method,
+        endpoint=request.url.path
+    ).observe(duration)
+    
+    response.headers["X-Process-Time"] = str(duration)
+    return response
+
 @app.on_event("startup")
 async def startup():
     global redis_client, rate_limiter
-    # CORRECTION ICI : aioredis → redis
     redis_client = await redis.from_url("redis://redis:6379", decode_responses=True)
     rate_limiter = RateLimiter(redis_client)
     logger.info("✅ API Gateway connected to Redis")
@@ -113,18 +167,23 @@ async def shutdown():
         await redis_client.close()
         logger.info("✅ API Gateway disconnected from Redis")
 
+# ============ PROMETHEUS METRICS ENDPOINT ============
+@app.get("/metrics")
+async def metrics():
+    """Endpoint Prometheus pour récupérer les métriques"""
+    return Response(
+        content=generate_latest(REGISTRY),
+        media_type=CONTENT_TYPE_LATEST
+    )
+
 @app.middleware("http")
 async def gateway_middleware(request: Request, call_next):
     """Main gateway middleware"""
-    
-    # Start timer
     start_time = time.time()
     
-    # Extract identifiers
     tenant_id = request.headers.get('X-Tenant-ID', 'default')
     client_ip = request.client.host
     
-    # Rate limiting checks
     if rate_limiter:
         if not await rate_limiter.check_tenant_limit(tenant_id):
             return JSONResponse(
@@ -138,7 +197,6 @@ async def gateway_middleware(request: Request, call_next):
                 content={"error": "IP rate limit exceeded"}
             )
     
-    # Process request
     try:
         response = await call_next(request)
     except Exception as e:
@@ -148,7 +206,6 @@ async def gateway_middleware(request: Request, call_next):
             content={"error": "Internal server error"}
         )
     
-    # Add metrics
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = str(process_time)
     
@@ -166,12 +223,11 @@ async def root():
         "service": "API Gateway",
         "version": "2.0.0",
         "status": "running",
-        "endpoints": ["/health", "/docs", "/api/v1/scans", "/api/v1/tenants"]
+        "endpoints": ["/health", "/metrics", "/docs", "/api/v1/scans", "/api/v1/tenants"]
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     redis_status = False
     if redis_client:
         try:
@@ -188,7 +244,6 @@ async def health_check():
 
 @app.get("/api/v1/health/services")
 async def services_health():
-    """Check health of downstream services"""
     import aiohttp
     
     services = {
@@ -196,7 +251,6 @@ async def services_health():
         "redis": False
     }
     
-    # Check orchestrator
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("http://orchestrator:8000/health", timeout=2) as resp:
@@ -204,7 +258,6 @@ async def services_health():
     except Exception as e:
         logger.debug(f"Orchestrator health check failed: {e}")
     
-    # Check Redis
     if redis_client:
         try:
             await redis_client.ping()

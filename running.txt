@@ -1,0 +1,15 @@
+# 1. Remplacer app.py par cette version corrigée
+
+# Démarrer les conteneurs en arrière-plan
+
+docker-compose up -d 
+
+# Voir l'état des conteneurs
+docker-compose ps
+
+# 3. Voir les logs
+docker-compose logs -f dashboard
+
+# 4. Tester l'API
+curl http://localhost:5000/api/health
+curl http://localhost:5000/api/findings/open

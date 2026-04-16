@@ -6,16 +6,71 @@ Handles multi-tenant, parallel scanning with resource management
 
 import asyncio
 import uuid
+import tempfile
+import subprocess
+import shutil
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
-import aioredis
+import redis.asyncio as redis
 import asyncpg
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, validator
 import logging
 import json
 import os
 from enum import Enum
+
+
+# ============ PROMETHEUS METRICS ============
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
+
+# Définir les métriques
+scans_total = Counter(
+    'scans_total', 
+    'Total number of security scans', 
+    ['status', 'tenant_id', 'scan_type']
+)
+
+findings_total = Counter(
+    'findings_total', 
+    'Total number of findings by severity', 
+    ['severity', 'scanner', 'tenant_id']
+)
+
+scan_duration_seconds = Histogram(
+    'scan_duration_seconds', 
+    'Duration of security scans in seconds',
+    ['scan_type', 'tenant_id'],
+    buckets=(30, 60, 120, 300, 600, 900, 1800, 3600)
+)
+
+active_scans = Gauge(
+    'active_scans', 
+    'Number of currently active scans',
+    ['tenant_id']
+)
+
+api_requests_total = Counter(
+    'api_requests_total',
+    'Total number of API requests',
+    ['method', 'endpoint', 'status_code']
+)
+
+api_request_duration_seconds = Histogram(
+    'api_request_duration_seconds',
+    'Duration of API requests in seconds',
+    ['method', 'endpoint'],
+    buckets=(0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10)
+)
+
+tenant_scans_total = Counter(
+    'tenant_scans_total',
+    'Total scans per tenant',
+    ['tenant_id']
+)
+
+# ============ FIN PROMETHEUS ============
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +111,7 @@ class ScanRequest(BaseModel):
     branch: str = "main"
     scan_types: List[ScanType]
     tenant_id: str
-    depth: str = "standard"  # quick, standard, deep
+    depth: str = "standard"
     callback_url: Optional[str] = None
 
     @validator('repo_url')
@@ -71,10 +126,32 @@ class ScanResult(BaseModel):
     repo_url: str
     start_time: datetime
     end_time: Optional[datetime] = None
-    status: str  # running, completed, failed
+    status: str
     findings: Dict[str, List[Dict]] = {}
     summary: Dict[str, int] = {}
     metadata: Dict = {}
+
+# ============= Middleware pour les métriques API =============
+
+@app.middleware("http")
+async def metrics_middleware(request, call_next):
+    """Middleware pour collecter les métriques des requêtes API"""
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    
+    api_requests_total.labels(
+        method=request.method,
+        endpoint=request.url.path,
+        status_code=response.status_code
+    ).inc()
+    
+    api_request_duration_seconds.labels(
+        method=request.method,
+        endpoint=request.url.path
+    ).observe(duration)
+    
+    return response
 
 # ============= Orchestrator Engine =============
 
@@ -87,16 +164,13 @@ class SecurityOrchestrator:
         self.scan_queue = asyncio.Queue()
         self.resource_semaphores: Dict[str, asyncio.Semaphore] = {}
         
-        # Initialize connections
         self.redis = None
         self.pool = None
         
     async def initialize(self):
         """Setup database connections"""
-        # Utiliser les noms des services Docker
-        self.redis = await aioredis.from_url(
-            "redis://redis:6379",  # Changé: localhost → redis
-            encoding="utf-8",
+        self.redis = await redis.from_url(
+            "redis://redis:6379",
             decode_responses=True
         )
         
@@ -104,14 +178,12 @@ class SecurityOrchestrator:
             user=os.getenv('POSTGRES_USER', 'postgres'),
             password=os.getenv('POSTGRES_PASSWORD', 'secure_password'),
             database=os.getenv('POSTGRES_DB', 'security_platform'),
-            host="postgres",  # Changé: localhost → postgres
+            host="postgres",
             min_size=5,
             max_size=20
         )
         
         logger.info("✅ Orchestrator connected to PostgreSQL and Redis")
-        
-        # Load tenants from database
         await self.load_tenants()
         
     async def load_tenants(self):
@@ -144,9 +216,7 @@ class SecurityOrchestrator:
     
     async def submit_scan(self, request: ScanRequest) -> str:
         """Submit a new scan request"""
-        # Validate tenant
         if request.tenant_id not in self.tenants:
-            # Create default tenant if not exists
             default_config = TenantConfig(
                 tenant_id=request.tenant_id,
                 name=f"Tenant-{request.tenant_id}",
@@ -156,15 +226,12 @@ class SecurityOrchestrator:
         
         tenant = self.tenants[request.tenant_id]
         
-        # Validate scanner permissions
         for scan_type in request.scan_types:
             if scan_type not in tenant.allowed_scanners:
                 raise ValueError(f"Scanner {scan_type} not allowed for tenant")
         
-        # Generate scan ID
         scan_id = str(uuid.uuid4())
         
-        # Create scan record
         scan = ScanResult(
             scan_id=scan_id,
             tenant_id=request.tenant_id,
@@ -180,13 +247,16 @@ class SecurityOrchestrator:
         
         self.active_scans[scan_id] = scan
         await self.scan_queue.put((scan_id, request))
+        await self.redis.setex(f"scan:{scan_id}", 3600, scan.json())
         
-        # Store in Redis for real-time updates
-        await self.redis.setex(
-            f"scan:{scan_id}",
-            3600,  # 1 hour TTL
-            scan.json()
-        )
+        for scan_type in request.scan_types:
+            scans_total.labels(
+                status="queued",
+                tenant_id=request.tenant_id,
+                scan_type=scan_type.value
+            ).inc()
+        
+        tenant_scans_total.labels(tenant_id=request.tenant_id).inc()
         
         logger.info(f"Scan {scan_id} queued for tenant {request.tenant_id}")
         return scan_id
@@ -197,7 +267,6 @@ class SecurityOrchestrator:
             scan_id, request = await self.scan_queue.get()
             tenant_id = request.tenant_id
             
-            # Acquire semaphore for tenant
             async with self.resource_semaphores[tenant_id]:
                 try:
                     await self.execute_scan(scan_id, request)
@@ -210,56 +279,139 @@ class SecurityOrchestrator:
     async def execute_scan(self, scan_id: str, request: ScanRequest):
         """Execute all requested scans in parallel"""
         logger.info(f"Starting scan {scan_id}")
+        start_time = time.time()
         
-        # Update status
         self.active_scans[scan_id].status = "running"
         await self.redis.set(f"scan:{scan_id}:status", "running")
         
-        # Simulate scan (remplacez par vrai code plus tard)
-        await asyncio.sleep(2)
+        active_scans.labels(tenant_id=request.tenant_id).inc()
         
-        # Mock findings
-        findings = {
-            "sast": [
-                {
-                    "id": "find-1",
-                    "title": "SQL Injection possible",
-                    "severity": "high",
-                    "file": "app.py",
-                    "line": 42
-                }
-            ],
-            "secrets": [
-                {
-                    "id": "secret-1",
-                    "title": "AWS Key found",
-                    "severity": "critical",
-                    "file": "config.py",
-                    "line": 10
-                }
-            ]
-        }
+        findings = []
+        summary = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'total': 0}
+        repo_path = None
         
-        # Calculate summary
-        summary = {
-            'critical': 1,
-            'high': 1,
-            'medium': 0,
-            'low': 0,
-            'total': 2
-        }
+        try:
+            # Cloner le dépôt
+            repo_path = tempfile.mkdtemp()
+            clone_result = subprocess.run(
+                ["git", "clone", "--depth", "1", request.repo_url, repo_path],
+                capture_output=True, text=True, timeout=120
+            )
+            if clone_result.returncode != 0:
+                raise Exception(f"Failed to clone: {clone_result.stderr}")
+            logger.info(f"📁 Repository cloned to {repo_path}")
+            
+            # Scanner avec Semgrep (SAST)
+            if ScanType.SAST in request.scan_types:
+                try:
+                    result = subprocess.run(
+                        ["semgrep", "--config", "auto", "--json", repo_path],
+                        capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+                    )
+                    if result.stdout:
+                        data = json.loads(result.stdout)
+                        for r in data.get('results', []):
+                            severity_raw = r.get('extra', {}).get('severity', 'medium').lower()
+                            severity_map = {'error': 'high', 'warning': 'medium', 'note': 'low'}
+                            severity = severity_map.get(severity_raw, severity_raw)
+                            if severity not in ['critical', 'high', 'medium', 'low', 'info']:
+                                severity = 'medium'
+                            
+                            findings.append({
+                                'title': r.get('check_id', 'Unknown')[:200],
+                                'description': r.get('extra', {}).get('message', '')[:500],
+                                'severity': severity,
+                                'scanner': 'semgrep',
+                                'type': 'sast',
+                                'file': r.get('path', '')[:200],
+                                'line': r.get('start', {}).get('line', 0)
+                            })
+                            summary[severity] = summary.get(severity, 0) + 1
+                            findings_total.labels(
+                                severity=severity,
+                                scanner='semgrep',
+                                tenant_id=request.tenant_id
+                            ).inc()
+                    logger.info(f"   🔍 Semgrep: {len([f for f in findings if f.get('scanner') == 'semgrep'])} findings")
+                except Exception as e:
+                    logger.error(f"Semgrep error: {e}")
+            
+            # Scanner avec Gitleaks (Secrets)
+            if ScanType.SECRETS in request.scan_types:
+                try:
+                    result = subprocess.run(
+                        ["gitleaks", "detect", "--source", repo_path, "--report-format", "json", "--no-git"],
+                        capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+                    )
+                    if result.stdout:
+                        data = json.loads(result.stdout)
+                        items = data if isinstance(data, list) else data.get('findings', [])
+                        for f in items:
+                            findings.append({
+                                'title': f"Secret: {f.get('RuleID', 'unknown')}"[:200],
+                                'description': f.get('Description', '')[:500],
+                                'severity': 'critical',
+                                'scanner': 'gitleaks',
+                                'type': 'secret',
+                                'file': f.get('File', '')[:200],
+                                'line': f.get('StartLine', 0)
+                            })
+                            summary['critical'] += 1
+                            findings_total.labels(
+                                severity='critical',
+                                scanner='gitleaks',
+                                tenant_id=request.tenant_id
+                            ).inc()
+                    logger.info(f"   🔐 Gitleaks: {len([f for f in findings if f.get('scanner') == 'gitleaks'])} findings")
+                except Exception as e:
+                    logger.error(f"Gitleaks error: {e}")
+            
+            summary['total'] = sum(summary.values())
+            
+            for scan_type in request.scan_types:
+                scans_total.labels(
+                    status="completed",
+                    tenant_id=request.tenant_id,
+                    scan_type=scan_type.value
+                ).inc()
+            
+            total_duration = time.time() - start_time
+            for scan_type in request.scan_types:
+                scan_duration_seconds.labels(
+                    scan_type=scan_type.value,
+                    tenant_id=request.tenant_id
+                ).observe(total_duration)
+            
+            scan = self.active_scans[scan_id]
+            scan.status = "completed"
+            scan.end_time = datetime.utcnow()
+            scan.findings = {}
+            scan.summary = summary
+            
+            await self.store_results(scan)
+            
+            logger.info(f"✅ Scan {scan_id} completed with {summary['total']} findings")
+            
+        except Exception as e:
+            logger.error(f"❌ Scan error: {e}")
+            scan = self.active_scans.get(scan_id)
+            if scan:
+                scan.status = "failed"
+                scan.end_time = datetime.utcnow()
+                scan.metadata['error'] = str(e)
+                await self.store_results(scan)
+            
+            for scan_type in request.scan_types:
+                scans_total.labels(
+                    status="failed",
+                    tenant_id=request.tenant_id,
+                    scan_type=scan_type.value
+                ).inc()
         
-        # Update scan record
-        scan = self.active_scans[scan_id]
-        scan.status = "completed"
-        scan.end_time = datetime.utcnow()
-        scan.findings = findings
-        scan.summary = summary
-        
-        # Store results
-        await self.store_results(scan)
-        
-        logger.info(f"Scan {scan_id} completed. Findings: {summary}")
+        finally:
+            active_scans.labels(tenant_id=request.tenant_id).dec()
+            if repo_path:
+                shutil.rmtree(repo_path, ignore_errors=True)
     
     async def store_results(self, scan: ScanResult):
         """Store scan results in database"""
@@ -290,6 +442,16 @@ class SecurityOrchestrator:
             scan.end_time = datetime.utcnow()
             scan.metadata['error'] = error
             await self.store_results(scan)
+            
+            if scan.metadata.get('scan_types'):
+                for scan_type in scan.metadata['scan_types']:
+                    scans_total.labels(
+                        status="failed",
+                        tenant_id=scan.tenant_id,
+                        scan_type=scan_type
+                    ).inc()
+            
+            active_scans.labels(tenant_id=scan.tenant_id).dec()
 
 # ============= FastAPI Routes =============
 
@@ -313,6 +475,14 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
+@app.get("/metrics")
+async def metrics():
+    """Endpoint Prometheus pour récupérer les métriques"""
+    return Response(
+        content=generate_latest(REGISTRY),
+        media_type=CONTENT_TYPE_LATEST
+    )
+
 @app.post("/api/v1/scans", response_model=Dict[str, str])
 async def create_scan(request: ScanRequest):
     """Submit a new scan"""
@@ -331,12 +501,10 @@ async def create_scan(request: ScanRequest):
 @app.get("/api/v1/scans/{scan_id}")
 async def get_scan(scan_id: str):
     """Get scan results"""
-    # Check Redis first
     cached = await orchestrator.redis.get(f"scan:{scan_id}")
     if cached:
         return json.loads(cached)
     
-    # Check database
     async with orchestrator.pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM scans WHERE scan_id = $1",
@@ -351,7 +519,6 @@ async def get_scan(scan_id: str):
 async def get_tenant_metrics(tenant_id: str):
     """Get security metrics for tenant"""
     async with orchestrator.pool.acquire() as conn:
-        # Get scan history
         rows = await conn.fetch(
             """
             SELECT 
@@ -368,7 +535,6 @@ async def get_tenant_metrics(tenant_id: str):
             tenant_id
         )
         
-        # Get trend analysis
         trends = []
         for row in rows:
             trends.append({
@@ -390,7 +556,6 @@ async def register_tenant(config: TenantConfig):
     try:
         orchestrator.register_tenant(config)
         
-        # Store in database
         async with orchestrator.pool.acquire() as conn:
             await conn.execute(
                 """
