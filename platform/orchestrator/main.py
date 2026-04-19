@@ -76,7 +76,8 @@ tenant_scans_total = Counter(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Security Orchestrator", version="2.0.0")
+# FIXED: Removed title and version parameters
+app = FastAPI()
 
 # ============= Data Models =============
 
@@ -276,6 +277,41 @@ class SecurityOrchestrator:
                 finally:
                     self.scan_queue.task_done()
     
+    async def save_findings(self, scan_id: str, tenant_id: str, findings: List[Dict]):
+        """Save individual findings to database"""
+        if not findings:
+            logger.info("No findings to save")
+            return
+        
+        async with self.pool.acquire() as conn:
+            saved_count = 0
+            for finding in findings:
+                try:
+                    await conn.execute("""
+                        INSERT INTO findings (
+                            finding_id, scan_id, tenant_id, title, description,
+                            severity, scanner_name, finding_type, file_path, line_start,
+                            status, detected_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open', NOW())
+                        ON CONFLICT (finding_id) DO NOTHING
+                    """,
+                        str(uuid.uuid4()), 
+                        scan_id, 
+                        tenant_id,
+                        finding.get('title', '')[:500],
+                        finding.get('description', '')[:1000],
+                        finding.get('severity', 'medium'),
+                        finding.get('scanner', 'unknown'),
+                        finding.get('type', 'vulnerability'),
+                        finding.get('file', '')[:500],
+                        finding.get('line', 0)
+                    )
+                    saved_count += 1
+                except Exception as e:
+                    logger.error(f"Failed to save finding: {e}")
+            
+            logger.info(f"💾 Saved {saved_count} findings to database")
+    
     async def execute_scan(self, scan_id: str, request: ScanRequest):
         """Execute all requested scans in parallel"""
         logger.info(f"Starting scan {scan_id}")
@@ -366,7 +402,10 @@ class SecurityOrchestrator:
                 except Exception as e:
                     logger.error(f"Gitleaks error: {e}")
             
-            summary['total'] = sum(summary.values())
+            summary['total'] = len(findings)
+            
+            # SAVE FINDINGS TO DATABASE
+            await self.save_findings(scan_id, request.tenant_id, findings)
             
             for scan_type in request.scan_types:
                 scans_total.labels(

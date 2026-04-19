@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unified Security Dashboard - Version corrigée avec toutes les fonctionnalités
+Unified Security Dashboard - Version with REAL data from database
 Combines data from Platform and Security components
 """
 
@@ -127,16 +127,23 @@ def add_finding_v1():
 
 @app.route('/api/overview')
 def get_overview():
-    """Get security overview metrics from database"""
+    """Get security overview metrics from database with REAL trend data"""
     try:
         conn = get_db()
         if not conn:
             logger.error("No database connection")
-            return jsonify(mock_overview_data())
+            return jsonify({
+                'error': 'Database unavailable',
+                'current': {'critical_open': 0, 'high_open': 0, 'medium': 0, 'low': 0},
+                'trends': [],
+                'compliance': [],
+                'recent_scans': [],
+                'critical_findings': []
+            }), 503
         
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # RÉELLES données de la base - COUNT UNIQUEMENT LES 'open'
+        # REAL counts from findings table (only OPEN findings)
         cur.execute("""
             SELECT 
                 COUNT(*) FILTER (WHERE severity = 'critical' AND status = 'open') as critical_open,
@@ -147,6 +154,33 @@ def get_overview():
         """)
         result = cur.fetchone()
         
+        # REAL trend data from last 30 days
+        cur.execute("""
+            SELECT 
+                DATE(detected_at) as date,
+                COUNT(*) FILTER (WHERE severity = 'critical') as critical,
+                COUNT(*) FILTER (WHERE severity = 'high') as high,
+                COUNT(*) FILTER (WHERE severity = 'medium') as medium,
+                COUNT(*) FILTER (WHERE severity = 'low') as low
+            FROM findings
+            WHERE detected_at > NOW() - INTERVAL '30 days'
+            GROUP BY DATE(detected_at)
+            ORDER BY date ASC
+        """)
+        trends_data = cur.fetchall()
+        
+        # Format trends for chart (REAL DATA)
+        trend_list = []
+        for t in trends_data:
+            if t['date']:
+                trend_list.append({
+                    'date': t['date'].isoformat(),
+                    'critical': t['critical'] or 0,
+                    'high': t['high'] or 0,
+                    'medium': t['medium'] or 0,
+                    'low': t['low'] or 0
+                })
+        
         # Récupérer les scans récents
         cur.execute("""
             SELECT scan_id, repo_url, status, created_at, findings_summary
@@ -155,6 +189,17 @@ def get_overview():
             LIMIT 10
         """)
         scans = cur.fetchall()
+        
+        # Convert datetime for scans
+        recent_scans = []
+        for scan in scans:
+            recent_scans.append({
+                'scan_id': scan['scan_id'],
+                'repo_url': scan['repo_url'] or 'unknown',
+                'status': scan['status'] or 'unknown',
+                'start_time': scan['created_at'].isoformat() if scan['created_at'] else None,
+                'summary': scan['findings_summary'] if scan['findings_summary'] else {}
+            })
         
         # Récupérer les findings critiques (open)
         cur.execute("""
@@ -169,17 +214,6 @@ def get_overview():
         cur.close()
         conn.close()
         
-        # Formater les scans récents
-        recent_scans = []
-        for scan in scans:
-            recent_scans.append({
-                'scan_id': scan['scan_id'],
-                'repo_url': scan['repo_url'] or 'unknown',
-                'status': scan['status'] or 'unknown',
-                'start_time': scan['created_at'].isoformat() if scan['created_at'] else None,
-                'summary': scan['findings_summary'] if scan['findings_summary'] else {}
-            })
-        
         # Formater les findings critiques
         critical_findings = []
         for f in critical:
@@ -191,7 +225,7 @@ def get_overview():
                 'line': f['line_start'] or 0
             })
         
-        # VRAIES données
+        # Current data
         current_data = {
             'critical_open': result['critical_open'] or 0,
             'high_open': result['high_open'] or 0,
@@ -200,14 +234,15 @@ def get_overview():
             'avg_age_hours': 48
         }
         
-        logger.info(f"✅ REAL DATA FROM DB: critical={current_data['critical_open']}, "
+        logger.info(f"✅ REAL DATA: critical={current_data['critical_open']}, "
                    f"high={current_data['high_open']}, "
                    f"medium={current_data['medium']}, "
-                   f"low={current_data['low']}")
+                   f"low={current_data['low']}, "
+                   f"trend_points={len(trend_list)}")
         
         return jsonify({
             'current': current_data,
-            'trends': generate_trend_data(),
+            'trends': trend_list,  # ← REAL TREND DATA!
             'compliance': [
                 {'framework': 'SOC2', 'compliance_score': 85},
                 {'framework': 'PCI-DSS', 'compliance_score': 72},
@@ -226,27 +261,22 @@ def get_overview():
         
     except Exception as e:
         logger.error(f"Error in get_overview: {e}")
-        return jsonify(mock_overview_data())
+        return jsonify({
+            'current': {'critical_open': 0, 'high_open': 0, 'medium': 0, 'low': 0},
+            'trends': [],
+            'compliance': [],
+            'recent_scans': [],
+            'critical_findings': [],
+            'error': str(e)
+        }), 500
 
-def generate_trend_data():
-    """Generate trend data for charts"""
-    trends = []
-    today = datetime.now()
-    for i in range(7, 0, -1):
-        date = today - timedelta(days=i)
-        trends.append({
-            'date': date.strftime('%Y-%m-%d'),
-            'critical': 2,
-            'high': 5,
-            'total': 10
-        })
-    return trends
+# REMOVED: generate_trend_data() - no longer needed (using real data)
 
 def mock_overview_data():
     """Return mock data when database is unavailable"""
     return {
         'current': {'critical_open': 3, 'high_open': 7, 'medium': 12, 'low': 25, 'avg_age_hours': 48},
-        'trends': generate_trend_data(),
+        'trends': [],  # Empty instead of mock data
         'compliance': [
             {'framework': 'SOC2', 'compliance_score': 85},
             {'framework': 'PCI-DSS', 'compliance_score': 72},
@@ -322,9 +352,10 @@ def get_open_findings():
         logger.error(f"Error in get_open_findings: {e}")
         return jsonify([])
 
+# ============ FIXED REMEDIATE FUNCTION ============
 @app.route('/api/remediate/<finding_id>', methods=['POST'])
 def remediate_finding(finding_id):
-    """Remediate a finding"""
+    """Remediate a finding - FIXED: removed status_changed_at column"""
     try:
         conn = get_db()
         if not conn:
@@ -332,12 +363,11 @@ def remediate_finding(finding_id):
         
         cur = conn.cursor()
         
-        # Chercher par ID exact
+        # FIXED: Removed status_changed_at column (doesn't exist in database)
         cur.execute("""
             UPDATE findings 
             SET status = 'fixed', 
-                fixed_at = NOW(),
-                status_changed_at = NOW()
+                fixed_at = NOW()
             WHERE finding_id::text = %s AND status = 'open'
             RETURNING finding_id, title
         """, (finding_id,))
@@ -357,7 +387,7 @@ def remediate_finding(finding_id):
         
         return jsonify({
             'status': 'completed',
-            'message': f'Finding has been fixed'
+            'message': 'Finding has been fixed'
         })
         
     except Exception as e:
@@ -823,6 +853,9 @@ def get_realtime_stats():
     """Récupérer les statistiques en temps réel"""
     try:
         conn = get_db()
+        if not conn:
+            return {}
+        
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         # Dernier scan
@@ -831,6 +864,10 @@ def get_realtime_stats():
             FROM scans ORDER BY created_at DESC LIMIT 1
         """)
         last_scan = cur.fetchone()
+        
+        # Convert datetime to string for JSON serialization
+        if last_scan and last_scan.get('created_at'):
+            last_scan['created_at'] = last_scan['created_at'].isoformat()
         
         # Statistiques des 5 dernières minutes
         cur.execute("""
@@ -897,5 +934,5 @@ except Exception as e:
     logger.error(f"❌ Failed to start scan scheduler: {e}")
 
 if __name__ == '__main__':
-    logger.info("Starting dashboard server...")
+    logger.info("Starting dashboard server with REAL trend data...")
     socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)

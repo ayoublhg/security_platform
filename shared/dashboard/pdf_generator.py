@@ -120,7 +120,6 @@ class PDFReportGenerator:
     def create_header(self, story):
         """Créer l'en-tête professionnel du rapport"""
         
-        # Logo ou titre principal
         story.append(Spacer(1, 0.5*inch))
         story.append(Paragraph("ENTERPRISE SECURITY PLATFORM", self.title_style))
         story.append(Paragraph("Rapport d'Analyse de Sécurité", self.subtitle_style))
@@ -143,14 +142,36 @@ class PDFReportGenerator:
         scan_date = scan_data.get('created_at', 'N/A')
         if hasattr(scan_date, 'strftime'):
             scan_date = scan_date.strftime('%d %B %Y à %H:%M:%S')
+        elif isinstance(scan_date, str):
+            try:
+                scan_date = datetime.fromisoformat(scan_date).strftime('%d %B %Y à %H:%M:%S')
+            except:
+                pass
+        
+        # Calculer la durée correctement
+        duration = scan_data.get('duration_seconds', 0)
+        if duration and duration > 0:
+            duration_str = f"{duration} secondes"
+        else:
+            # Calculer à partir des timestamps
+            start_time = scan_data.get('start_time')
+            end_time = scan_data.get('end_time')
+            if start_time and end_time:
+                if hasattr(start_time, 'strftime'):
+                    duration = (end_time - start_time).total_seconds()
+                    duration_str = f"{int(duration)} secondes"
+                else:
+                    duration_str = "Non disponible"
+            else:
+                duration_str = "Non disponible"
         
         # Tableau des métadonnées
         metadata = [
             ["📦 Dépôt scanné", scan_data.get('repo_url', 'N/A')],
             ["📅 Date du scan", scan_date],
-            ["⏱️ Durée", f"{scan_data.get('duration_seconds', 0)} secondes"],
+            ["⏱️ Durée", duration_str],
             ["📊 Statut", scan_data.get('status', 'N/A').upper()],
-            ["🏢 Tenant", tenant_info.get('name', 'Default') if tenant_info else 'Default']
+            ["🏢 Tenant", tenant_info.get('name', 'Default Tenant') if tenant_info else 'Default Tenant']
         ]
         
         metadata_table = Table(metadata, colWidths=[2.5*inch, 4.5*inch])
@@ -168,10 +189,28 @@ class PDFReportGenerator:
         story.append(metadata_table)
         story.append(Spacer(1, 0.3*inch))
 
-    def create_summary_section(self, story, summary):
-        """Créer la section récapitulative avec graphiques"""
+    def create_summary_section(self, story, summary, findings):
+        """Créer la section récapitulative avec graphiques et calculs corrects"""
         
         story.append(Paragraph("ANALYSE DES VULNÉRABILITÉS", self.section_title_style))
+        
+        # Calculer les totaux réels à partir des findings si le summary est incorrect
+        if findings and (summary.get('total', 0) == 0 or summary.get('critical', 0) == 0):
+            # Recalculer à partir des findings
+            critical_count = sum(1 for f in findings if f.get('severity', '').lower() == 'critical')
+            high_count = sum(1 for f in findings if f.get('severity', '').lower() == 'high')
+            medium_count = sum(1 for f in findings if f.get('severity', '').lower() == 'medium')
+            low_count = sum(1 for f in findings if f.get('severity', '').lower() == 'low')
+            total = len(findings)
+            
+            # Mettre à jour le summary
+            summary = {
+                'critical': critical_count,
+                'high': high_count,
+                'medium': medium_count,
+                'low': low_count,
+                'total': total
+            }
         
         # Créer les graphiques
         summary_data = self._create_summary_charts(summary)
@@ -184,14 +223,14 @@ class PDFReportGenerator:
         # Tableau des métriques
         total = max(summary.get('total', 1), 1)
         metrics = [
-            ["Critique", str(summary.get('critical', 0)), f"{summary.get('critical', 0)/total*100:.1f}%"],
-            ["Élevée", str(summary.get('high', 0)), f"{summary.get('high', 0)/total*100:.1f}%"],
-            ["Moyenne", str(summary.get('medium', 0)), f"{summary.get('medium', 0)/total*100:.1f}%"],
-            ["Faible", str(summary.get('low', 0)), f"{summary.get('low', 0)/total*100:.1f}%"],
-            ["Total", str(summary.get('total', 0)), "100%"]
+            ["Critique", str(summary.get('critical', 0)), f"{summary.get('critical', 0)/total*100:.1f}%", colors.HexColor('#dc3545')],
+            ["Élevée", str(summary.get('high', 0)), f"{summary.get('high', 0)/total*100:.1f}%", colors.HexColor('#fd7e14')],
+            ["Moyenne", str(summary.get('medium', 0)), f"{summary.get('medium', 0)/total*100:.1f}%", colors.HexColor('#ffc107')],
+            ["Faible", str(summary.get('low', 0)), f"{summary.get('low', 0)/total*100:.1f}%", colors.HexColor('#28a745')],
+            ["Total", str(summary.get('total', 0)), "100%", colors.HexColor('#6c757d')]
         ]
         
-        metrics_table = Table([["Sévérité", "Nombre", "Pourcentage"]] + metrics, 
+        metrics_table = Table([["Sévérité", "Nombre", "Pourcentage"]] + [[m[0], m[1], m[2]] for m in metrics[:5]], 
                               colWidths=[2.5*inch, 1.5*inch, 1.5*inch])
         
         # Style pour l'en-tête
@@ -201,25 +240,19 @@ class PDFReportGenerator:
                 ('TEXTCOLOR', (i, 0), (i, 0), colors.white),
                 ('ALIGN', (i, 0), (i, 0), 'CENTER'),
                 ('FONTNAME', (i, 0), (i, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (i, 0), (i, 0), 11),
             ]))
         
-        # Style pour les cellules
+        # Style pour les lignes avec couleurs
         for row in range(1, len(metrics) + 1):
-            severity = metrics[row-1][0].lower()
-            if severity == 'critique':
-                metrics_table.setStyle(TableStyle([
-                    ('TEXTCOLOR', (0, row), (0, row), colors.HexColor('#dc3545')),
-                    ('FONTNAME', (0, row), (0, row), 'Helvetica-Bold'),
-                ]))
-            elif severity == 'élevée':
-                metrics_table.setStyle(TableStyle([
-                    ('TEXTCOLOR', (0, row), (0, row), colors.HexColor('#fd7e14')),
-                    ('FONTNAME', (0, row), (0, row), 'Helvetica-Bold'),
-                ]))
+            metrics_table.setStyle(TableStyle([
+                ('TEXTCOLOR', (0, row), (0, row), metrics[row-1][3]),
+                ('FONTNAME', (0, row), (0, row), 'Helvetica-Bold'),
+            ]))
         
         metrics_table.setStyle(TableStyle([
             ('ALIGN', (1, 1), (2, -1), 'CENTER'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dee2e6')),
             ('TOPPADDING', (0, 0), (-1, -1), 8),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
@@ -227,9 +260,11 @@ class PDFReportGenerator:
         
         story.append(metrics_table)
         story.append(Spacer(1, 0.3*inch))
+        
+        return summary  # Return the corrected summary
 
     def _create_summary_charts(self, summary):
-        """Créer des graphiques professionnels"""
+        """Créer des graphiques professionnels avec les bonnes valeurs"""
         
         try:
             # Style professionnel seaborn
@@ -248,6 +283,7 @@ class PDFReportGenerator:
             bars = ax1.bar(severities, counts, color=colors_bar, edgecolor='black', linewidth=1.5)
             ax1.set_ylabel('Nombre de vulnérabilités', fontsize=12, fontweight='bold')
             ax1.set_title('Distribution par Sévérité', fontsize=14, fontweight='bold', pad=15)
+            ax1.set_ylim(0, max(counts) * 1.2 if max(counts) > 0 else 10)
             
             for bar, count in zip(bars, counts):
                 if count > 0:
@@ -255,7 +291,8 @@ class PDFReportGenerator:
                             str(count), ha='center', va='bottom', fontsize=11, fontweight='bold')
             
             # Graphique 2: Camembert
-            if sum(counts) > 0:
+            total = sum(counts)
+            if total > 0:
                 wedges, texts, autotexts = ax2.pie(counts, labels=severities, autopct='%1.1f%%',
                                                    startangle=90, explode=(0.05, 0.05, 0.05, 0.05))
                 ax2.set_title('Répartition en Pourcentage', fontsize=14, fontweight='bold', pad=15)
@@ -264,6 +301,10 @@ class PDFReportGenerator:
                     autotext.set_color('white')
                     autotext.set_fontsize(11)
                     autotext.set_fontweight('bold')
+            else:
+                ax2.text(0.5, 0.5, 'Aucune vulnérabilité\ndétectée', 
+                        ha='center', va='center', transform=ax2.transAxes, fontsize=14)
+                ax2.set_title('Répartition en Pourcentage', fontsize=14, fontweight='bold', pad=15)
             
             plt.suptitle(f"Analyse des Vulnérabilités - Total: {summary.get('total', 0)}", 
                         fontsize=16, fontweight='bold', y=1.05)
@@ -282,101 +323,115 @@ class PDFReportGenerator:
             return None
 
     def create_findings_table(self, story, findings):
-        """Créer le tableau des vulnérabilités"""
+        """Créer le tableau détaillé des vulnérabilités"""
         
         story.append(Paragraph("LISTE DES VULNÉRABILITÉS", self.section_title_style))
         
-        # Filtrer les vulnérabilités critiques et élevées
-        critical_findings = [f for f in findings if f.get('severity') in ['critical', 'high']]
+        if not findings or len(findings) == 0:
+            story.append(Paragraph("✅ Aucune vulnérabilité détectée.", self.styles['Normal']))
+            story.append(Spacer(1, 0.3*inch))
+            return
         
-        if critical_findings:
-            # En-tête du tableau
-            data = [["#", "Sévérité", "Titre", "Fichier", "Ligne"]]
+        # Trier par sévérité (critical d'abord)
+        sorted_findings = sorted(findings, key=lambda x: 
+            {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}.get(x.get('severity', 'low').lower(), 4))
+        
+        # En-tête du tableau
+        data = [["#", "Sévérité", "Titre", "Scanner", "Fichier", "Ligne"]]
+        
+        for i, finding in enumerate(sorted_findings[:50], 1):  # Limite à 50 findings
+            severity = finding.get('severity', 'medium').upper()
+            title = finding.get('title', 'N/A')[:80]
+            scanner = finding.get('scanner_name', finding.get('scanner', 'unknown')).upper()
+            file_path = finding.get('file_path', 'N/A')
+            if '/' in file_path:
+                file_path = file_path.split('/')[-1]
+            elif '\\' in file_path:
+                file_path = file_path.split('\\')[-1]
+            line = str(finding.get('line_start', finding.get('line_number', 0)))
             
-            for i, finding in enumerate(critical_findings[:25], 1):
-                severity = finding.get('severity', 'medium').upper()
-                data.append([
-                    str(i),
-                    severity,
-                    finding.get('title', 'N/A')[:60],
-                    finding.get('file_path', 'N/A').split('/')[-1],
-                    str(finding.get('line_start', 0))
-                ])
-            
-            # Créer le tableau
-            findings_table = Table(data, colWidths=[0.5*inch, 0.8*inch, 3.5*inch, 1.5*inch, 0.5*inch])
-            
-            # Style pour l'en-tête
-            for i in range(5):
-                findings_table.setStyle(TableStyle([
-                    ('BACKGROUND', (i, 0), (i, 0), colors.HexColor('#2c3e50')),
-                    ('TEXTCOLOR', (i, 0), (i, 0), colors.white),
-                    ('ALIGN', (i, 0), (i, 0), 'CENTER'),
-                    ('FONTNAME', (i, 0), (i, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (i, 0), (i, 0), 10),
-                ]))
-            
-            # Style pour les lignes
-            for row in range(1, len(data)):
-                severity = data[row][1].lower()
-                if severity == 'critical':
-                    findings_table.setStyle(TableStyle([
-                        ('BACKGROUND', (0, row), (-1, row), colors.HexColor('#fff5f5')),
-                        ('TEXTCOLOR', (1, row), (1, row), colors.HexColor('#dc3545')),
-                        ('FONTNAME', (1, row), (1, row), 'Helvetica-Bold'),
-                    ]))
-                elif severity == 'high':
-                    findings_table.setStyle(TableStyle([
-                        ('BACKGROUND', (0, row), (-1, row), colors.HexColor('#fff8f0')),
-                        ('TEXTCOLOR', (1, row), (1, row), colors.HexColor('#fd7e14')),
-                        ('FONTNAME', (1, row), (1, row), 'Helvetica-Bold'),
-                    ]))
-            
+            data.append([str(i), severity, title, scanner, file_path, line])
+        
+        # Créer le tableau
+        findings_table = Table(data, colWidths=[0.4*inch, 0.7*inch, 3.2*inch, 0.8*inch, 1.2*inch, 0.4*inch])
+        
+        # Style pour l'en-tête
+        for i in range(6):
             findings_table.setStyle(TableStyle([
-                ('FONTSIZE', (0, 1), (-1, -1), 9),
-                ('ALIGN', (0, 1), (0, -1), 'CENTER'),
-                ('ALIGN', (4, 1), (4, -1), 'CENTER'),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dee2e6')),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('BACKGROUND', (i, 0), (i, 0), colors.HexColor('#2c3e50')),
+                ('TEXTCOLOR', (i, 0), (i, 0), colors.white),
+                ('ALIGN', (i, 0), (i, 0), 'CENTER'),
+                ('FONTNAME', (i, 0), (i, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (i, 0), (i, 0), 9),
             ]))
-            
-            story.append(findings_table)
-            
-            if len(critical_findings) > 25:
-                story.append(Paragraph(f"* Seulement les 25 premières vulnérabilités sont affichées sur {len(critical_findings)} totales.", 
-                                      self.styles['Italic']))
-        else:
-            story.append(Paragraph("✅ Aucune vulnérabilité critique ou élevée détectée.", 
+        
+        # Style pour les lignes selon la sévérité
+        for row in range(1, len(data)):
+            severity = data[row][1].lower()
+            if severity == 'critical':
+                findings_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, row), (-1, row), colors.HexColor('#fff5f5')),
+                    ('TEXTCOLOR', (1, row), (1, row), colors.HexColor('#dc3545')),
+                    ('FONTNAME', (1, row), (1, row), 'Helvetica-Bold'),
+                ]))
+            elif severity == 'high':
+                findings_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, row), (-1, row), colors.HexColor('#fff8f0')),
+                    ('TEXTCOLOR', (1, row), (1, row), colors.HexColor('#fd7e14')),
+                    ('FONTNAME', (1, row), (1, row), 'Helvetica-Bold'),
+                ]))
+            elif severity == 'medium':
+                findings_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, row), (-1, row), colors.HexColor('#fffef5')),
+                ]))
+        
+        findings_table.setStyle(TableStyle([
+            ('FONTSIZE', (0, 1), (-1, -1), 8),
+            ('ALIGN', (0, 1), (0, -1), 'CENTER'),
+            ('ALIGN', (1, 1), (1, -1), 'CENTER'),
+            ('ALIGN', (3, 1), (3, -1), 'CENTER'),
+            ('ALIGN', (5, 1), (5, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dee2e6')),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('LEFTPADDING', (0, 0), (-1, -1), 4),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        
+        story.append(findings_table)
+        
+        if len(sorted_findings) > 50:
+            story.append(Paragraph(f"<i>* Seulement les 50 premières vulnérabilités sont affichées sur {len(sorted_findings)} totales.</i>", 
                                   self.styles['Normal']))
         
         story.append(Spacer(1, 0.3*inch))
 
     def create_recommendations(self, story, summary):
-        """Créer la section des recommandations"""
+        """Créer la section des recommandations basée sur les vulnérabilités trouvées"""
         
         story.append(Paragraph("RECOMMANDATIONS", self.section_title_style))
         
         recommendations = []
         
+        # Recommandations basées sur les vulnérabilités trouvées
         if summary.get('critical', 0) > 0:
-            recommendations.append(("🔴 CRITIQUE", "Corriger IMMÉDIATEMENT les vulnérabilités critiques (sous 24h)"))
+            recommendations.append(("🔴 CRITIQUE", f"Corriger IMMÉDIATEMENT les {summary.get('critical', 0)} vulnérabilités critiques (sous 24h)"))
         if summary.get('high', 0) > 0:
-            recommendations.append(("🟠 HAUTE", "Corriger sous 72 heures les vulnérabilités élevées"))
+            recommendations.append(("🟠 HAUTE", f"Corriger sous 72 heures les {summary.get('high', 0)} vulnérabilités élevées"))
         if summary.get('medium', 0) > 0:
-            recommendations.append(("🟡 MOYENNE", "Planifier la correction des vulnérabilités moyennes"))
+            recommendations.append(("🟡 MOYENNE", f"Planifier la correction des {summary.get('medium', 0)} vulnérabilités moyennes"))
         
         recommendations.extend([
             ("📦 DÉPENDANCES", "Mettre à jour les dépendances vulnérables vers les versions sécurisées"),
             ("🔄 RÉÉVALUATION", "Re-scanner après correction pour valider les correctifs"),
-            ("📚 FORMATION", "Former les développeurs aux bonnes pratiques de sécurité"),
+            ("📚 FORMATION", "Former les développeurs aux bonnes pratiques de sécurité (OWASP Top 10)"),
             ("📊 MONITORING", "Mettre en place une surveillance continue des vulnérabilités")
         ])
         
         # Créer le tableau des recommandations
         rec_data = [["Priorité", "Action Recommandée"]] + recommendations
-        rec_table = Table(rec_data, colWidths=[1.5*inch, 5.5*inch])
+        rec_table = Table(rec_data, colWidths=[1.8*inch, 5.2*inch])
         
         # Style pour l'en-tête
         for i in range(2):
@@ -385,14 +440,17 @@ class PDFReportGenerator:
                 ('TEXTCOLOR', (i, 0), (i, 0), colors.white),
                 ('ALIGN', (i, 0), (i, 0), 'CENTER'),
                 ('FONTNAME', (i, 0), (i, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (i, 0), (i, 0), 11),
             ]))
         
         rec_table.setStyle(TableStyle([
-            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dee2e6')),
             ('TOPPADDING', (0, 0), (-1, -1), 8),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ('LEFTPADDING', (0, 0), (-1, -1), 8),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 8),
         ]))
         
         story.append(rec_table)
@@ -426,9 +484,12 @@ class PDFReportGenerator:
         # Construction du rapport
         self.create_header(story)
         self.create_metadata_section(story, scan_data, tenant_info)
-        self.create_summary_section(story, summary)
+        
+        # Passer les findings à create_summary_section pour un calcul correct
+        corrected_summary = self.create_summary_section(story, summary, findings)
+        
         self.create_findings_table(story, findings)
-        self.create_recommendations(story, summary)
+        self.create_recommendations(story, corrected_summary if corrected_summary else summary)
         self.create_footer(story)
         
         # Génération du PDF
