@@ -1,0 +1,30 @@
+groups:
+  - name: security_alerts
+    rules:
+      - alert: HighCriticalFindings
+        expr: sum(scan_critical_findings) > 10
+        for: 1h
+        annotations:
+          summary: "High number of critical findings detected"
+          description: "There are {{ $value }} critical findings across all scans"
+
+      - alert: ScanFailureRate
+        expr: rate(scan_failures_total[1h]) > 0.1
+        for: 15m
+        annotations:
+          summary: "High scan failure rate"
+          description: "Scan failure rate is {{ $value }}%"
+
+      - alert: RemediationSLABreach
+        expr: time() - finding_last_updated{severity="critical"} > 86400
+        for: 1h
+        annotations:
+          summary: "Critical finding remediation SLA breached"
+          description: "Critical finding {{ $labels.finding_id }} is older than 24 hours"
+
+      - alert: ComplianceScoreDrop
+        expr: compliance_score < 80
+        for: 30m
+        annotations:
+          summary: "Compliance score dropped below threshold"
+          description: "Compliance score is {{ $value }}%"

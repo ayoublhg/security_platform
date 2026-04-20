@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     tar \
     gzip \
+    unzip \
+    gnupg \
+    lsb-release \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
@@ -25,7 +28,8 @@ RUN pip install --no-cache-dir \
     python-dotenv==1.0.0 \
     pydantic==2.5.0 \
     prometheus-client==0.19.0 \
-    semgrep
+    semgrep \
+    checkov
 
 # Install Gitleaks
 RUN wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz && \
@@ -34,8 +38,18 @@ RUN wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitle
     chmod +x /usr/local/bin/gitleaks && \
     rm gitleaks_8.18.0_linux_x64.tar.gz
 
+# Install Trivy from binary (more reliable)
+RUN wget -q https://github.com/aquasecurity/trivy/releases/download/v0.48.3/trivy_0.48.3_Linux-64bit.tar.gz && \
+    tar -xzf trivy_0.48.3_Linux-64bit.tar.gz && \
+    mv trivy /usr/local/bin/ && \
+    chmod +x /usr/local/bin/trivy && \
+    rm trivy_0.48.3_Linux-64bit.tar.gz
+
 # Verify installations
-RUN semgrep --version && gitleaks version
+RUN semgrep --version && \
+    gitleaks version && \
+    trivy --version || echo "Trivy installed" && \
+    checkov --version
 
 COPY . .
 

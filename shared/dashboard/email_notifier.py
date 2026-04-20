@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Système de notifications par email
+Système de notifications par email - Enhanced with Grafana integration
 """
 
 import smtplib
@@ -13,6 +13,7 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Optional
 import asyncio
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +28,196 @@ class EmailNotifier:
         self.from_email = os.getenv('FROM_EMAIL', self.smtp_user)
         self.enabled = bool(self.smtp_user and self.smtp_password)
         
+        # Grafana webhook URL (for alerts)
+        self.grafana_webhook = os.getenv('GRAFANA_WEBHOOK', '')
+        
         if not self.enabled:
             logger.warning("Email notifications disabled: SMTP credentials not configured")
+    
+    async def send_grafana_alert(self, alert: Dict, recipients: List[str]):
+        """Envoyer une alerte Grafana"""
+        if not self.enabled:
+            return
+        
+        severity = alert.get('labels', {}).get('severity', 'warning')
+        alertname = alert.get('labels', {}).get('alertname', 'Unknown Alert')
+        
+        severity_colors = {
+            'critical': '#dc3545',
+            'warning': '#ffc107',
+            'info': '#17a2b8'
+        }
+        
+        color = severity_colors.get(severity, '#6c757d')
+        
+        subject = f"[{severity.upper()}] {alertname} - Security Platform"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; }}
+                .header {{ background-color: {color}; color: white; padding: 20px; text-align: center; }}
+                .content {{ padding: 20px; }}
+                .alert {{ background-color: #f8f9fa; padding: 15px; margin: 10px 0; border-left: 4px solid {color}; }}
+                .severity {{ display: inline-block; padding: 3px 8px; border-radius: 3px; color: white; font-size: 12px; }}
+                .critical {{ background-color: #dc3545; }}
+                .warning {{ background-color: #ffc107; color: black; }}
+                .info {{ background-color: #17a2b8; }}
+                .footer {{ background-color: #f8f9fa; padding: 10px; text-align: center; font-size: 12px; color: #666; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>🚨 Alerte Grafana</h1>
+                <p>{alertname}</p>
+            </div>
+            <div class="content">
+                <div class="alert">
+                    <h3>{alert.get('annotations', {}).get('summary', alertname)}</h3>
+                    <p><strong>Sévérité:</strong> <span class="severity {severity}">{severity.upper()}</span></p>
+                    <p><strong>Description:</strong> {alert.get('annotations', {}).get('description', 'N/A')}</p>
+                    <p><strong>Valeur:</strong> {alert.get('value', 'N/A')}</p>
+                    <p><strong>Heure:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p>
+                </div>
+                
+                <h3>Actions recommandées:</h3>
+                <ul>
+                    <li>Connectez-vous au tableau de bord pour plus de détails</li>
+                    <li>Vérifiez les logs du système</li>
+                    <li>Analysez les métriques Prometheus</li>
+                </ul>
+                
+                <p><a href="http://localhost:3000">Voir Grafana</a> | 
+                   <a href="http://localhost:5000">Voir Dashboard Sécurité</a></p>
+            </div>
+            <div class="footer">
+                <p>Enterprise Security Platform - Alerte automatique</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        await self._send_email(recipients, subject, html_body)
+    
+    async def send_metrics_report(self, metrics: Dict, recipients: List[str]):
+        """Envoyer un rapport périodique des métriques"""
+        if not self.enabled:
+            return
+        
+        subject = f"📈 Rapport Métriques - {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; }}
+                .header {{ background-color: #667eea; color: white; padding: 20px; text-align: center; }}
+                .content {{ padding: 20px; }}
+                .metric {{ background-color: #f8f9fa; padding: 10px; margin: 5px 0; border-left: 3px solid #667eea; }}
+                .metric-value {{ font-size: 18px; font-weight: bold; color: #667eea; }}
+                .footer {{ background-color: #f8f9fa; padding: 10px; text-align: center; font-size: 12px; color: #666; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>📊 Rapport des Métriques</h1>
+                <p>{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}</p>
+            </div>
+            <div class="content">
+                <h3>Métriques clés:</h3>
+                
+                <div class="metric">
+                    <strong>📦 Total des scans:</strong>
+                    <span class="metric-value">{metrics.get('total_scans', 0)}</span>
+                </div>
+                
+                <div class="metric">
+                    <strong>✅ Taux de succès:</strong>
+                    <span class="metric-value">{metrics.get('success_rate', 0)}%</span>
+                </div>
+                
+                <div class="metric">
+                    <strong>🔍 Dernier scan:</strong>
+                    <span class="metric-value">{metrics.get('last_scan_time', 'N/A')}</span>
+                </div>
+                
+                <div class="metric">
+                    <strong>⏱️ Durée moyenne des scans:</strong>
+                    <span class="metric-value">{metrics.get('avg_duration', 0)}s</span>
+                </div>
+                
+                <h3>Vulnérabilités:</h3>
+                <ul>
+                    <li>Critiques: <strong style="color:#dc3545">{metrics.get('critical_findings', 0)}</strong></li>
+                    <li>Élevées: <strong style="color:#fd7e14">{metrics.get('high_findings', 0)}</strong></li>
+                    <li>Moyennes: <strong style="color:#ffc107">{metrics.get('medium_findings', 0)}</strong></li>
+                    <li>Faibles: <strong style="color:#28a745">{metrics.get('low_findings', 0)}</strong></li>
+                </ul>
+                
+                <h3>Activité par scanner:</h3>
+                <ul>
+                    {''.join([f"<li><strong>{scanner}:</strong> {count} vulnérabilités</li>" for scanner, count in metrics.get('scanner_stats', {}).items()])}
+                </ul>
+            </div>
+            <div class="footer">
+                <p>Enterprise Security Platform - Rapport automatique</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        await self._send_email(recipients, subject, html_body)
+    
+    async def send_system_health(self, health_data: Dict, recipients: List[str]):
+        """Envoyer un rapport de santé du système"""
+        if not self.enabled:
+            return
+        
+        subject = f"🏥 Rapport Santé Système - {datetime.now().strftime('%d/%m/%Y')}"
+        
+        status_emoji = "✅" if health_data.get('status') == 'healthy' else "⚠️"
+        status_color = "#28a745" if health_data.get('status') == 'healthy' else "#ffc107"
+        
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; }}
+                .header {{ background-color: {status_color}; color: white; padding: 20px; text-align: center; }}
+                .content {{ padding: 20px; }}
+                .service {{ background-color: #f8f9fa; padding: 10px; margin: 5px 0; border-left: 3px solid #28a745; }}
+                .service-down {{ border-left-color: #dc3545; }}
+                .footer {{ background-color: #f8f9fa; padding: 10px; text-align: center; font-size: 12px; color: #666; }}
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>{status_emoji} Rapport de Santé Système</h1>
+            </div>
+            <div class="content">
+                <h3>Services:</h3>
+                {''.join([f'<div class="service {"" if healthy else "service-down"}">✅ <strong>{name}:</strong> {"En ligne" if healthy else "Hors ligne"}</div>' for name, healthy in health_data.get('services', {}).items()])}
+                
+                <h3>Métriques système:</h3>
+                <ul>
+                    <li>Uptime: {health_data.get('uptime', 'N/A')}</li>
+                    <li>Mémoire utilisée: {health_data.get('memory_used', 'N/A')}</li>
+                    <li>CPU: {health_data.get('cpu_usage', 'N/A')}%</li>
+                    <li>Conteneurs actifs: {health_data.get('active_containers', 0)}</li>
+                </ul>
+            </div>
+            <div class="footer">
+                <p>Enterprise Security Platform - Rapport santé automatique</p>
+            </div>
+        </body>
+        </html>
+        """
+        
+        await self._send_email(recipients, subject, html_body)
     
     async def send_critical_alert(self, finding: Dict, tenant_id: str, recipients: List[str]):
         """Envoyer une alerte pour une vulnérabilité critique"""
@@ -154,7 +343,6 @@ class EmailNotifier:
         
         subject = f"✅ Scan terminé - {repo_url.split('/')[-1]}"
         
-        # CORRECTION 1: Lien href corrigé
         html_body = f"""
         <!DOCTYPE html>
         <html>
@@ -210,7 +398,7 @@ class EmailNotifier:
             part = MIMEText(html_body, 'html')
             msg.attach(part)
             
-            # CORRECTION 2: Exécution synchrone dans un thread séparé
+            # Exécution synchrone dans un thread séparé
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._send_sync, msg)
             

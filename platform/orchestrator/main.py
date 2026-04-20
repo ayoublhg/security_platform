@@ -21,65 +21,21 @@ import json
 import os
 from enum import Enum
 
-
-# ============ PROMETHEUS METRICS ============
 from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST, REGISTRY
 
-# Définir les métriques
-scans_total = Counter(
-    'scans_total', 
-    'Total number of security scans', 
-    ['status', 'tenant_id', 'scan_type']
-)
+# Metrics
+scans_total = Counter('scans_total', '', ['status', 'tenant_id', 'scan_type'])
+findings_total = Counter('findings_total', '', ['severity', 'scanner', 'tenant_id'])
+scan_duration_seconds = Histogram('scan_duration_seconds', '', ['scan_type', 'tenant_id'], buckets=(30, 60, 120, 300, 600, 900, 1800, 3600))
+active_scans = Gauge('active_scans', '', ['tenant_id'])
+api_requests_total = Counter('api_requests_total', '', ['method', 'endpoint', 'status_code'])
+api_request_duration_seconds = Histogram('api_request_duration_seconds', '', ['method', 'endpoint'], buckets=(0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10))
+tenant_scans_total = Counter('tenant_scans_total', '', ['tenant_id'])
 
-findings_total = Counter(
-    'findings_total', 
-    'Total number of findings by severity', 
-    ['severity', 'scanner', 'tenant_id']
-)
-
-scan_duration_seconds = Histogram(
-    'scan_duration_seconds', 
-    'Duration of security scans in seconds',
-    ['scan_type', 'tenant_id'],
-    buckets=(30, 60, 120, 300, 600, 900, 1800, 3600)
-)
-
-active_scans = Gauge(
-    'active_scans', 
-    'Number of currently active scans',
-    ['tenant_id']
-)
-
-api_requests_total = Counter(
-    'api_requests_total',
-    'Total number of API requests',
-    ['method', 'endpoint', 'status_code']
-)
-
-api_request_duration_seconds = Histogram(
-    'api_request_duration_seconds',
-    'Duration of API requests in seconds',
-    ['method', 'endpoint'],
-    buckets=(0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10)
-)
-
-tenant_scans_total = Counter(
-    'tenant_scans_total',
-    'Total scans per tenant',
-    ['tenant_id']
-)
-
-# ============ FIN PROMETHEUS ============
-
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FIXED: Removed title and version parameters
 app = FastAPI()
-
-# ============= Data Models =============
 
 class ScanType(str, Enum):
     SAST = "sast"
@@ -107,6 +63,9 @@ class TenantConfig(BaseModel):
     jira_project: Optional[str] = None
     compliance_frameworks: List[str] = []
 
+    class Config:
+        use_enum_values = True
+
 class ScanRequest(BaseModel):
     repo_url: str
     branch: str = "main"
@@ -121,6 +80,9 @@ class ScanRequest(BaseModel):
             raise ValueError('Only GitHub/GitLab URLs supported')
         return v
 
+    class Config:
+        use_enum_values = True
+
 class ScanResult(BaseModel):
     scan_id: str
     tenant_id: str
@@ -132,49 +94,26 @@ class ScanResult(BaseModel):
     summary: Dict[str, int] = {}
     metadata: Dict = {}
 
-# ============= Middleware pour les métriques API =============
-
 @app.middleware("http")
 async def metrics_middleware(request, call_next):
-    """Middleware pour collecter les métriques des requêtes API"""
     start_time = time.time()
     response = await call_next(request)
     duration = time.time() - start_time
-    
-    api_requests_total.labels(
-        method=request.method,
-        endpoint=request.url.path,
-        status_code=response.status_code
-    ).inc()
-    
-    api_request_duration_seconds.labels(
-        method=request.method,
-        endpoint=request.url.path
-    ).observe(duration)
-    
+    api_requests_total.labels(method=request.method, endpoint=request.url.path, status_code=response.status_code).inc()
+    api_request_duration_seconds.labels(method=request.method, endpoint=request.url.path).observe(duration)
     return response
 
-# ============= Orchestrator Engine =============
-
 class SecurityOrchestrator:
-    """Enterprise-grade orchestrator with resource management"""
-    
     def __init__(self):
         self.tenants: Dict[str, TenantConfig] = {}
         self.active_scans: Dict[str, ScanResult] = {}
         self.scan_queue = asyncio.Queue()
         self.resource_semaphores: Dict[str, asyncio.Semaphore] = {}
-        
         self.redis = None
         self.pool = None
         
     async def initialize(self):
-        """Setup database connections"""
-        self.redis = await redis.from_url(
-            "redis://redis:6379",
-            decode_responses=True
-        )
-        
+        self.redis = await redis.from_url("redis://redis:6379", decode_responses=True)
         self.pool = await asyncpg.create_pool(
             user=os.getenv('POSTGRES_USER', 'postgres'),
             password=os.getenv('POSTGRES_PASSWORD', 'secure_password'),
@@ -183,12 +122,10 @@ class SecurityOrchestrator:
             min_size=5,
             max_size=20
         )
-        
         logger.info("✅ Orchestrator connected to PostgreSQL and Redis")
         await self.load_tenants()
         
     async def load_tenants(self):
-        """Load tenant configurations"""
         try:
             async with self.pool.acquire() as conn:
                 rows = await conn.fetch("SELECT * FROM tenants WHERE active = true")
@@ -198,52 +135,37 @@ class SecurityOrchestrator:
                         name=row['name'],
                         max_concurrent_scans=row['max_concurrent'],
                         allowed_scanners=[ScanType(s) for s in row['allowed_scanners']],
-                        webhook_url=row['webhook_url'],
-                        slack_channel=row['slack_channel'],
-                        jira_project=row['jira_project'],
-                        compliance_frameworks=row['compliance_frameworks']
+                        webhook_url=row.get('webhook_url'),
+                        slack_channel=row.get('slack_channel'),
+                        jira_project=row.get('jira_project'),
+                        compliance_frameworks=row.get('compliance_frameworks', [])
                     )
                     self.register_tenant(config)
         except Exception as e:
             logger.warning(f"No tenants loaded yet: {e}")
     
     def register_tenant(self, config: TenantConfig):
-        """Register a new tenant with resource limits"""
         self.tenants[config.tenant_id] = config
-        self.resource_semaphores[config.tenant_id] = asyncio.Semaphore(
-            config.max_concurrent_scans
-        )
+        self.resource_semaphores[config.tenant_id] = asyncio.Semaphore(config.max_concurrent_scans)
         logger.info(f"Registered tenant: {config.name} ({config.tenant_id})")
     
     async def submit_scan(self, request: ScanRequest) -> str:
-        """Submit a new scan request"""
         if request.tenant_id not in self.tenants:
             default_config = TenantConfig(
                 tenant_id=request.tenant_id,
                 name=f"Tenant-{request.tenant_id}",
-                allowed_scanners=[ScanType.SAST, ScanType.SCA, ScanType.SECRETS]
+                allowed_scanners=[ScanType.SAST, ScanType.SCA, ScanType.SECRETS, ScanType.CONTAINER, ScanType.IAC]
             )
             self.register_tenant(default_config)
         
-        tenant = self.tenants[request.tenant_id]
-        
-        for scan_type in request.scan_types:
-            if scan_type not in tenant.allowed_scanners:
-                raise ValueError(f"Scanner {scan_type} not allowed for tenant")
-        
         scan_id = str(uuid.uuid4())
-        
         scan = ScanResult(
             scan_id=scan_id,
             tenant_id=request.tenant_id,
             repo_url=request.repo_url,
             start_time=datetime.utcnow(),
             status="queued",
-            metadata={
-                "branch": request.branch,
-                "depth": request.depth,
-                "callback_url": request.callback_url
-            }
+            metadata={"branch": request.branch, "depth": request.depth, "callback_url": request.callback_url}
         )
         
         self.active_scans[scan_id] = scan
@@ -251,34 +173,24 @@ class SecurityOrchestrator:
         await self.redis.setex(f"scan:{scan_id}", 3600, scan.json())
         
         for scan_type in request.scan_types:
-            scans_total.labels(
-                status="queued",
-                tenant_id=request.tenant_id,
-                scan_type=scan_type.value
-            ).inc()
+            scans_total.labels(status="queued", tenant_id=request.tenant_id, scan_type=scan_type.value).inc()
         
         tenant_scans_total.labels(tenant_id=request.tenant_id).inc()
-        
         logger.info(f"Scan {scan_id} queued for tenant {request.tenant_id}")
         return scan_id
     
     async def worker(self):
-        """Background worker that processes scans"""
         while True:
             scan_id, request = await self.scan_queue.get()
-            tenant_id = request.tenant_id
-            
-            async with self.resource_semaphores[tenant_id]:
+            async with self.resource_semaphores[request.tenant_id]:
                 try:
                     await self.execute_scan(scan_id, request)
                 except Exception as e:
                     logger.error(f"Scan {scan_id} failed: {str(e)}")
-                    await self.handle_scan_failure(scan_id, str(e))
                 finally:
                     self.scan_queue.task_done()
     
     async def save_findings(self, scan_id: str, tenant_id: str, findings: List[Dict]):
-        """Save individual findings to database"""
         if not findings:
             logger.info("No findings to save")
             return
@@ -295,9 +207,7 @@ class SecurityOrchestrator:
                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open', NOW())
                         ON CONFLICT (finding_id) DO NOTHING
                     """,
-                        str(uuid.uuid4()), 
-                        scan_id, 
-                        tenant_id,
+                        str(uuid.uuid4()), scan_id, tenant_id,
                         finding.get('title', '')[:500],
                         finding.get('description', '')[:1000],
                         finding.get('severity', 'medium'),
@@ -309,11 +219,92 @@ class SecurityOrchestrator:
                     saved_count += 1
                 except Exception as e:
                     logger.error(f"Failed to save finding: {e}")
-            
             logger.info(f"💾 Saved {saved_count} findings to database")
     
+    async def scan_with_trivy(self, repo_path: str, findings: List, summary: Dict, tenant_id: str):
+        """Scan with Trivy for container and filesystem vulnerabilities"""
+        logger.info("   🐳 Running Trivy filesystem scan...")
+        try:
+            result = subprocess.run(
+                ["trivy", "fs", "--format", "json", "--severity", "CRITICAL,HIGH,MEDIUM,LOW", repo_path],
+                capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+            )
+            if result.stdout:
+                data = json.loads(result.stdout)
+                for target in data.get('Results', []):
+                    for vuln in target.get('Vulnerabilities', []):
+                        severity = vuln.get('Severity', 'medium').lower()
+                        findings.append({
+                            'title': f"Trivy: {vuln.get('VulnerabilityID', 'Unknown')} - {vuln.get('Title', '')[:100]}",
+                            'description': vuln.get('Description', '')[:500],
+                            'severity': severity,
+                            'scanner': 'trivy',
+                            'type': 'container',
+                            'file': target.get('Target', ''),
+                            'line': 0
+                        })
+                        summary[severity] = summary.get(severity, 0) + 1
+                        findings_total.labels(severity=severity, scanner='trivy', tenant_id=tenant_id).inc()
+            logger.info(f"   🐳 Trivy: {len([f for f in findings if f.get('scanner') == 'trivy'])} findings")
+        except Exception as e:
+            logger.error(f"Trivy error: {e}")
+    
+    async def scan_with_checkov(self, repo_path: str, findings: List, summary: Dict, tenant_id: str):
+        """Scan with Checkov for IaC misconfigurations"""
+        logger.info("   🏗️ Running Checkov IaC scan...")
+        try:
+            result = subprocess.run(
+                ["checkov", "-d", repo_path, "--output", "json", "--quiet"],
+                capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+            )
+            if result.stdout:
+                data = json.loads(result.stdout)
+                for check in data.get('results', {}).get('failed_checks', []):
+                    severity = check.get('severity', 'medium').lower()
+                    findings.append({
+                        'title': f"Checkov: {check.get('check_name', 'Unknown')}",
+                        'description': check.get('check_description', '')[:500],
+                        'severity': severity,
+                        'scanner': 'checkov',
+                        'type': 'iac',
+                        'file': check.get('file_path', ''),
+                        'line': check.get('file_line_range', [0, 0])[0] if check.get('file_line_range') else 0
+                    })
+                    summary[severity] = summary.get(severity, 0) + 1
+                    findings_total.labels(severity=severity, scanner='checkov', tenant_id=tenant_id).inc()
+            logger.info(f"   🏗️ Checkov: {len([f for f in findings if f.get('scanner') == 'checkov'])} findings")
+        except Exception as e:
+            logger.error(f"Checkov error: {e}")
+    
+    async def scan_with_dependency_check(self, repo_path: str, findings: List, summary: Dict, tenant_id: str):
+        """Scan with OWASP Dependency Check for vulnerable dependencies"""
+        logger.info("   📦 Running OWASP Dependency Check...")
+        try:
+            result = subprocess.run(
+                ["dependency-check", "--scan", repo_path, "--format", "JSON", "--pretty"],
+                capture_output=True, text=True, timeout=600, encoding='utf-8', errors='ignore'
+            )
+            if result.stdout:
+                data = json.loads(result.stdout)
+                for dep in data.get('dependencies', []):
+                    for vuln in dep.get('vulnerabilities', []):
+                        severity = vuln.get('severity', 'medium').lower()
+                        findings.append({
+                            'title': f"OWASP DC: {vuln.get('name', 'Unknown')}",
+                            'description': vuln.get('description', '')[:500],
+                            'severity': severity,
+                            'scanner': 'dependency-check',
+                            'type': 'sca',
+                            'file': dep.get('filePath', '').split('/')[-1],
+                            'line': 0
+                        })
+                        summary[severity] = summary.get(severity, 0) + 1
+                        findings_total.labels(severity=severity, scanner='dependency-check', tenant_id=tenant_id).inc()
+            logger.info(f"   📦 OWASP DC: {len([f for f in findings if f.get('scanner') == 'dependency-check'])} findings")
+        except Exception as e:
+            logger.error(f"Dependency check error: {e}")
+    
     async def execute_scan(self, scan_id: str, request: ScanRequest):
-        """Execute all requested scans in parallel"""
         logger.info(f"Starting scan {scan_id}")
         start_time = time.time()
         
@@ -327,7 +318,6 @@ class SecurityOrchestrator:
         repo_path = None
         
         try:
-            # Cloner le dépôt
             repo_path = tempfile.mkdtemp()
             clone_result = subprocess.run(
                 ["git", "clone", "--depth", "1", request.repo_url, repo_path],
@@ -337,7 +327,7 @@ class SecurityOrchestrator:
                 raise Exception(f"Failed to clone: {clone_result.stderr}")
             logger.info(f"📁 Repository cloned to {repo_path}")
             
-            # Scanner avec Semgrep (SAST)
+            # SAST with Semgrep
             if ScanType.SAST in request.scan_types:
                 try:
                     result = subprocess.run(
@@ -363,16 +353,12 @@ class SecurityOrchestrator:
                                 'line': r.get('start', {}).get('line', 0)
                             })
                             summary[severity] = summary.get(severity, 0) + 1
-                            findings_total.labels(
-                                severity=severity,
-                                scanner='semgrep',
-                                tenant_id=request.tenant_id
-                            ).inc()
+                            findings_total.labels(severity=severity, scanner='semgrep', tenant_id=request.tenant_id).inc()
                     logger.info(f"   🔍 Semgrep: {len([f for f in findings if f.get('scanner') == 'semgrep'])} findings")
                 except Exception as e:
                     logger.error(f"Semgrep error: {e}")
             
-            # Scanner avec Gitleaks (Secrets)
+            # Secrets with Gitleaks
             if ScanType.SECRETS in request.scan_types:
                 try:
                     result = subprocess.run(
@@ -393,33 +379,33 @@ class SecurityOrchestrator:
                                 'line': f.get('StartLine', 0)
                             })
                             summary['critical'] += 1
-                            findings_total.labels(
-                                severity='critical',
-                                scanner='gitleaks',
-                                tenant_id=request.tenant_id
-                            ).inc()
+                            findings_total.labels(severity='critical', scanner='gitleaks', tenant_id=request.tenant_id).inc()
                     logger.info(f"   🔐 Gitleaks: {len([f for f in findings if f.get('scanner') == 'gitleaks'])} findings")
                 except Exception as e:
                     logger.error(f"Gitleaks error: {e}")
             
+            # Container with Trivy
+            if ScanType.CONTAINER in request.scan_types:
+                await self.scan_with_trivy(repo_path, findings, summary, request.tenant_id)
+            
+            # IaC with Checkov
+            if ScanType.IAC in request.scan_types:
+                await self.scan_with_checkov(repo_path, findings, summary, request.tenant_id)
+            
+            # SCA with OWASP Dependency Check
+            if ScanType.SCA in request.scan_types:
+                await self.scan_with_dependency_check(repo_path, findings, summary, request.tenant_id)
+            
             summary['total'] = len(findings)
             
-            # SAVE FINDINGS TO DATABASE
             await self.save_findings(scan_id, request.tenant_id, findings)
             
             for scan_type in request.scan_types:
-                scans_total.labels(
-                    status="completed",
-                    tenant_id=request.tenant_id,
-                    scan_type=scan_type.value
-                ).inc()
+                scans_total.labels(status="completed", tenant_id=request.tenant_id, scan_type=scan_type.value).inc()
             
             total_duration = time.time() - start_time
             for scan_type in request.scan_types:
-                scan_duration_seconds.labels(
-                    scan_type=scan_type.value,
-                    tenant_id=request.tenant_id
-                ).observe(total_duration)
+                scan_duration_seconds.labels(scan_type=scan_type.value, tenant_id=request.tenant_id).observe(total_duration)
             
             scan = self.active_scans[scan_id]
             scan.status = "completed"
@@ -428,7 +414,6 @@ class SecurityOrchestrator:
             scan.summary = summary
             
             await self.store_results(scan)
-            
             logger.info(f"✅ Scan {scan_id} completed with {summary['total']} findings")
             
         except Exception as e:
@@ -439,60 +424,22 @@ class SecurityOrchestrator:
                 scan.end_time = datetime.utcnow()
                 scan.metadata['error'] = str(e)
                 await self.store_results(scan)
-            
-            for scan_type in request.scan_types:
-                scans_total.labels(
-                    status="failed",
-                    tenant_id=request.tenant_id,
-                    scan_type=scan_type.value
-                ).inc()
-        
         finally:
             active_scans.labels(tenant_id=request.tenant_id).dec()
             if repo_path:
                 shutil.rmtree(repo_path, ignore_errors=True)
     
     async def store_results(self, scan: ScanResult):
-        """Store scan results in database"""
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO scans (
-                    scan_id, tenant_id, repo_url, start_time, end_time,
-                    status, findings, summary, metadata
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            await conn.execute("""
+                INSERT INTO scans (scan_id, tenant_id, repo_url, start_time, end_time, status, findings, summary, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (scan_id) DO UPDATE SET
-                    status = EXCLUDED.status,
-                    end_time = EXCLUDED.end_time,
-                    findings = EXCLUDED.findings,
-                    summary = EXCLUDED.summary
-                """,
-                scan.scan_id, scan.tenant_id, scan.repo_url,
+                    status = EXCLUDED.status, end_time = EXCLUDED.end_time,
+                    findings = EXCLUDED.findings, summary = EXCLUDED.summary
+            """, scan.scan_id, scan.tenant_id, scan.repo_url,
                 scan.start_time, scan.end_time, scan.status,
-                json.dumps(scan.findings), json.dumps(scan.summary),
-                json.dumps(scan.metadata)
-            )
-    
-    async def handle_scan_failure(self, scan_id: str, error: str):
-        """Handle scan failures"""
-        scan = self.active_scans.get(scan_id)
-        if scan:
-            scan.status = "failed"
-            scan.end_time = datetime.utcnow()
-            scan.metadata['error'] = error
-            await self.store_results(scan)
-            
-            if scan.metadata.get('scan_types'):
-                for scan_type in scan.metadata['scan_types']:
-                    scans_total.labels(
-                        status="failed",
-                        tenant_id=scan.tenant_id,
-                        scan_type=scan_type
-                    ).inc()
-            
-            active_scans.labels(tenant_id=scan.tenant_id).dec()
-
-# ============= FastAPI Routes =============
+                json.dumps(scan.findings), json.dumps(scan.summary), json.dumps(scan.metadata))
 
 orchestrator = SecurityOrchestrator()
 
@@ -501,37 +448,19 @@ async def startup():
     await orchestrator.initialize()
     asyncio.create_task(orchestrator.worker())
 
-@app.get("/")
-async def root():
-    return {
-        "service": "Security Orchestrator",
-        "version": "2.0.0",
-        "status": "running",
-        "tenants": len(orchestrator.tenants)
-    }
-
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
 @app.get("/metrics")
 async def metrics():
-    """Endpoint Prometheus pour récupérer les métriques"""
-    return Response(
-        content=generate_latest(REGISTRY),
-        media_type=CONTENT_TYPE_LATEST
-    )
+    return Response(content=generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/api/v1/scans", response_model=Dict[str, str])
 async def create_scan(request: ScanRequest):
-    """Submit a new scan"""
     try:
         scan_id = await orchestrator.submit_scan(request)
-        return {
-            "scan_id": scan_id,
-            "status": "queued",
-            "message": "Scan submitted successfully"
-        }
+        return {"scan_id": scan_id, "status": "queued", "message": "Scan submitted successfully"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -539,82 +468,31 @@ async def create_scan(request: ScanRequest):
 
 @app.get("/api/v1/scans/{scan_id}")
 async def get_scan(scan_id: str):
-    """Get scan results"""
     cached = await orchestrator.redis.get(f"scan:{scan_id}")
     if cached:
         return json.loads(cached)
-    
     async with orchestrator.pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM scans WHERE scan_id = $1",
-            scan_id
-        )
+        row = await conn.fetchrow("SELECT * FROM scans WHERE scan_id = $1", scan_id)
         if row:
             return dict(row)
-    
     raise HTTPException(status_code=404, detail="Scan not found")
-
-@app.get("/api/v1/tenants/{tenant_id}/metrics")
-async def get_tenant_metrics(tenant_id: str):
-    """Get security metrics for tenant"""
-    async with orchestrator.pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT 
-                DATE(start_time) as date,
-                COALESCE(SUM((summary->>'critical')::int), 0) as critical,
-                COALESCE(SUM((summary->>'high')::int), 0) as high,
-                COUNT(*) as total_scans
-            FROM scans
-            WHERE tenant_id = $1
-                AND start_time > NOW() - INTERVAL '30 days'
-            GROUP BY DATE(start_time)
-            ORDER BY date DESC
-            """,
-            tenant_id
-        )
-        
-        trends = []
-        for row in rows:
-            trends.append({
-                "date": row['date'].isoformat() if row['date'] else None,
-                "critical": row['critical'] or 0,
-                "high": row['high'] or 0,
-                "scans": row['total_scans']
-            })
-        
-        return {
-            "tenant_id": tenant_id,
-            "trends": trends,
-            "total_findings_30d": sum(t['critical'] + t['high'] for t in trends)
-        }
 
 @app.post("/api/v1/tenants")
 async def register_tenant(config: TenantConfig):
-    """Register a new tenant"""
     try:
         orchestrator.register_tenant(config)
-        
         async with orchestrator.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO tenants (
-                    tenant_id, name, max_concurrent, allowed_scanners,
-                    webhook_url, slack_channel, jira_project,
-                    compliance_frameworks, active
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            await conn.execute("""
+                INSERT INTO tenants (tenant_id, name, max_concurrent, allowed_scanners,
+                    webhook_url, slack_channel, jira_project, compliance_frameworks, active)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (tenant_id) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    max_concurrent = EXCLUDED.max_concurrent,
-                    allowed_scanners = EXCLUDED.allowed_scanners,
-                    active = EXCLUDED.active
-                """,
-                config.tenant_id, config.name, config.max_concurrent_scans,
+                    name = EXCLUDED.name, max_concurrent = EXCLUDED.max_concurrent,
+                    allowed_scanners = EXCLUDED.allowed_scanners, active = EXCLUDED.active
+            """, config.tenant_id, config.name, config.max_concurrent_scans,
                 [s.value for s in config.allowed_scanners],
                 config.webhook_url, config.slack_channel, config.jira_project,
-                config.compliance_frameworks, True
-            )
-        
+                config.compliance_frameworks, True)
         return {"status": "success", "message": f"Tenant {config.name} registered"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

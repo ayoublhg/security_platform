@@ -31,7 +31,16 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'dev-secret-key-change-in-production'
-socketio = SocketIO(app, cors_allowed_origins="*")
+
+# SocketIO avec configuration optimisée pour éviter les déconnexions
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*",
+    ping_timeout=60,
+    ping_interval=25,
+    transports=['websocket', 'polling'],
+    async_mode='threading'
+)
 
 # Redis client
 redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
@@ -71,6 +80,120 @@ def index():
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
+@app.route('/api/scanners')
+def get_scanners():
+    """Get list of scanners that have findings in the database"""
+    try:
+        conn = get_db()
+        if not conn:
+            return jsonify([])
+        
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT DISTINCT scanner_name, 
+                   COUNT(*) as count
+            FROM findings 
+            WHERE scanner_name IS NOT NULL
+            GROUP BY scanner_name
+            ORDER BY scanner_name
+        """)
+        
+        scanners = []
+        icons = {
+            'semgrep': '🔍',
+            'gitleaks': '🔐', 
+            'trivy': '🐳',
+            'checkov': '🏗️',
+            'dependency-check': '📦'
+        }
+        types = {
+            'semgrep': 'SAST',
+            'gitleaks': 'Secrets',
+            'trivy': 'Container',
+            'checkov': 'IaC',
+            'dependency-check': 'SCA'
+        }
+        
+        for row in cur.fetchall():
+            name = row['scanner_name']
+            scanners.append({
+                'name': name,
+                'icon': icons.get(name, '🔧'),
+                'type': types.get(name, 'Unknown'),
+                'count': row['count']
+            })
+        
+        cur.close()
+        conn.close()
+        return jsonify(scanners)
+        
+    except Exception as e:
+        logger.error(f"Error getting scanners: {e}")
+        return jsonify([])
+
+@app.route('/api/system/health')
+def system_health():
+    """Get system health metrics for monitoring"""
+    try:
+        containers = []
+        try:
+            result = subprocess.run(['docker', 'ps', '--format', 'json'], 
+                                   capture_output=True, text=True, timeout=10)
+            if result.stdout:
+                containers = [json.loads(line) for line in result.stdout.strip().split('\n') if line]
+        except Exception as e:
+            logger.warning(f"Could not get container stats: {e}")
+        
+        services = {
+            'orchestrator': any('orchestrator' in c.get('Names', '') for c in containers),
+            'dashboard': any('dashboard' in c.get('Names', '') for c in containers),
+            'postgres': any('postgres' in c.get('Names', '') for c in containers),
+            'redis': any('redis' in c.get('Names', '') for c in containers),
+            'grafana': any('grafana' in c.get('Names', '') for c in containers),
+            'prometheus': any('prometheus' in c.get('Names', '') for c in containers),
+            'api-gateway': any('api-gateway' in c.get('Names', '') for c in containers),
+        }
+        
+        health_data = {
+            'status': 'healthy' if all(services.values()) else 'degraded',
+            'services': services,
+            'uptime': subprocess.getoutput('uptime'),
+            'active_containers': len(containers),
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return jsonify(health_data)
+    except Exception as e:
+        logger.error(f"Error getting system health: {e}")
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+@app.route('/api/system/metrics')
+def system_metrics():
+    """Get detailed system metrics without external dependencies"""
+    try:
+        conn = get_db()
+        db_stats = {}
+        if conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM findings")
+            db_stats['total_findings'] = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM scans")
+            db_stats['total_scans'] = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+        
+        metrics = {
+            'cpu': {'percent': 'N/A', 'cores': 'N/A'},
+            'memory': {'percent': 'N/A', 'available': 'N/A', 'used': 'N/A'},
+            'database': db_stats,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return jsonify(metrics)
+    except Exception as e:
+        logger.error(f"Error getting system metrics: {e}")
+        return jsonify({'error': str(e)}), 500
+
 # ============ API POUR LES SCANS (multi_scan.py) ============
 
 @app.route('/api/v1/findings', methods=['POST'])
@@ -86,11 +209,9 @@ def add_finding_v1():
         
         cur = conn.cursor()
         
-        # Vérifier si le scan existe
         scan_id = data.get('scan_id')
         cur.execute("SELECT 1 FROM scans WHERE scan_id = %s", (scan_id,))
         if not cur.fetchone():
-            # Créer un scan fictif si nécessaire
             cur.execute("""
                 INSERT INTO scans (scan_id, tenant_id, repo_url, status, created_at)
                 VALUES (%s, %s, %s, 'completed', NOW())
@@ -115,6 +236,22 @@ def add_finding_v1():
         conn.commit()
         cur.close()
         conn.close()
+        
+        if data.get('severity') == 'critical' and email_notifier.enabled:
+            recipients = os.getenv('ALERT_RECIPIENTS', '').split(',')
+            if recipients:
+                finding = {
+                    'title': data.get('title', ''),
+                    'description': data.get('description', ''),
+                    'severity': data.get('severity', 'critical'),
+                    'scanner': data.get('scanner_name', 'unknown'),
+                    'file': data.get('file_path', ''),
+                    'line': data.get('line_start', 0)
+                }
+                asyncio.run_coroutine_threadsafe(
+                    email_notifier.send_critical_alert(finding, data.get('tenant_id', 'default'), recipients),
+                    loop
+                )
         
         logger.info(f"✅ Finding added: {data.get('title', '')[:50]}")
         return jsonify({'status': 'success'}), 201
@@ -143,7 +280,6 @@ def get_overview():
         
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # REAL counts from findings table (only OPEN findings)
         cur.execute("""
             SELECT 
                 COUNT(*) FILTER (WHERE severity = 'critical' AND status = 'open') as critical_open,
@@ -154,7 +290,6 @@ def get_overview():
         """)
         result = cur.fetchone()
         
-        # REAL trend data from last 30 days
         cur.execute("""
             SELECT 
                 DATE(detected_at) as date,
@@ -169,7 +304,6 @@ def get_overview():
         """)
         trends_data = cur.fetchall()
         
-        # Format trends for chart (REAL DATA)
         trend_list = []
         for t in trends_data:
             if t['date']:
@@ -181,7 +315,6 @@ def get_overview():
                     'low': t['low'] or 0
                 })
         
-        # Récupérer les scans récents
         cur.execute("""
             SELECT scan_id, repo_url, status, created_at, findings_summary
             FROM scans
@@ -190,7 +323,6 @@ def get_overview():
         """)
         scans = cur.fetchall()
         
-        # Convert datetime for scans
         recent_scans = []
         for scan in scans:
             recent_scans.append({
@@ -201,9 +333,8 @@ def get_overview():
                 'summary': scan['findings_summary'] if scan['findings_summary'] else {}
             })
         
-        # Récupérer les findings critiques (open)
         cur.execute("""
-            SELECT finding_id, title, severity, file_path, line_start
+            SELECT finding_id, title, severity, file_path, line_start, scanner_name
             FROM findings
             WHERE severity IN ('critical', 'high') AND status = 'open'
             ORDER BY detected_at DESC
@@ -214,18 +345,22 @@ def get_overview():
         cur.close()
         conn.close()
         
-        # Formater les findings critiques
         critical_findings = []
         for f in critical:
+            scanner_icon = {
+                'semgrep': '🔍', 'gitleaks': '🔐', 'trivy': '🐳',
+                'checkov': '🏗️', 'dependency-check': '📦'
+            }.get(f.get('scanner_name', ''), '🔧')
+            
             critical_findings.append({
                 'finding_id': str(f['finding_id']),
                 'title': f['title'] or 'No title',
                 'severity': f['severity'],
+                'scanner': f"{scanner_icon} {f.get('scanner_name', 'unknown')}",
                 'file': f['file_path'] or 'unknown',
                 'line': f['line_start'] or 0
             })
         
-        # Current data
         current_data = {
             'critical_open': result['critical_open'] or 0,
             'high_open': result['high_open'] or 0,
@@ -242,7 +377,7 @@ def get_overview():
         
         return jsonify({
             'current': current_data,
-            'trends': trend_list,  # ← REAL TREND DATA!
+            'trends': trend_list,
             'compliance': [
                 {'framework': 'SOC2', 'compliance_score': 85},
                 {'framework': 'PCI-DSS', 'compliance_score': 72},
@@ -270,13 +405,11 @@ def get_overview():
             'error': str(e)
         }), 500
 
-# REMOVED: generate_trend_data() - no longer needed (using real data)
-
 def mock_overview_data():
     """Return mock data when database is unavailable"""
     return {
         'current': {'critical_open': 3, 'high_open': 7, 'medium': 12, 'low': 25, 'avg_age_hours': 48},
-        'trends': [],  # Empty instead of mock data
+        'trends': [],
         'compliance': [
             {'framework': 'SOC2', 'compliance_score': 85},
             {'framework': 'PCI-DSS', 'compliance_score': 72},
@@ -290,7 +423,7 @@ def mock_overview_data():
 
 @app.route('/api/findings/open')
 def get_open_findings():
-    """Get open findings for remediation queue"""
+    """Get open findings for remediation queue with scanner info"""
     try:
         conn = get_db()
         if not conn:
@@ -302,7 +435,10 @@ def get_open_findings():
                 finding_id::text,
                 title, 
                 severity, 
+                scanner_name,
                 finding_type as type,
+                file_path,
+                line_start,
                 detected_at,
                 status
             FROM findings
@@ -315,7 +451,7 @@ def get_open_findings():
                     ELSE 4
                 END,
                 detected_at ASC
-            LIMIT 20
+            LIMIT 50
         """)
         
         rows = cur.fetchall()
@@ -329,6 +465,16 @@ def get_open_findings():
         result = []
         now = datetime.now().replace(tzinfo=None)
         
+        scanner_icons = {
+            'semgrep': '🔍',
+            'gitleaks': '🔐',
+            'trivy': '🐳',
+            'checkov': '🏗️',
+            'dependency-check': '📦',
+            'grype': '🐙',
+            'tfsec': '🏗️'
+        }
+        
         for row in rows:
             age_hours = 0
             if row['detected_at']:
@@ -336,11 +482,17 @@ def get_open_findings():
                 age = now - detected
                 age_hours = int(age.total_seconds() / 3600)
             
+            scanner = row.get('scanner_name', 'unknown').lower()
+            icon = scanner_icons.get(scanner, '🔧')
+            
             result.append({
                 'finding_id': row['finding_id'],
                 'title': row['title'] or 'No title',
                 'severity': row['severity'],
+                'scanner': f"{icon} {scanner}",
                 'type': row['type'] or 'unknown',
+                'file': row['file_path'] or 'unknown',
+                'line': row['line_start'] or 0,
                 'age_hours': age_hours,
                 'status': row['status']
             })
@@ -363,7 +515,6 @@ def remediate_finding(finding_id):
         
         cur = conn.cursor()
         
-        # FIXED: Removed status_changed_at column (doesn't exist in database)
         cur.execute("""
             UPDATE findings 
             SET status = 'fixed', 
@@ -404,7 +555,6 @@ def get_remediation_logs():
         
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # Check if table exists
         cur.execute("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -453,7 +603,6 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
     repo_path = None
     
     try:
-        # 1. Cloner le dépôt (bloquant mais nécessaire)
         repo_path = tempfile.mkdtemp()
         subprocess.run(["git", "clone", "--depth", "1", repo_url, repo_path], 
                       capture_output=True, timeout=120)
@@ -461,7 +610,6 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
         
         findings = []
         
-        # 2. Scanner avec Semgrep (SAST)
         if 'sast' in scan_types:
             try:
                 result = subprocess.run(
@@ -472,11 +620,7 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
                     data = json.loads(result.stdout)
                     for r in data.get('results', []):
                         severity_raw = r.get('extra', {}).get('severity', 'medium').lower()
-                        severity_map = {
-                            'error': 'high',
-                            'warning': 'medium',
-                            'note': 'low'
-                        }
+                        severity_map = {'error': 'high', 'warning': 'medium', 'note': 'low'}
                         severity = severity_map.get(severity_raw, severity_raw)
                         if severity not in ['critical', 'high', 'medium', 'low', 'info']:
                             severity = 'medium'
@@ -490,11 +634,10 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
                             'file': r.get('path', '')[:200],
                             'line': r.get('start', {}).get('line', 0)
                         })
-                logger.info(f"   🔍 Semgrep: {len(findings)} findings")
+                logger.info(f"   🔍 Semgrep: {len([f for f in findings if f.get('scanner') == 'semgrep'])} findings")
             except Exception as e:
                 logger.error(f"Semgrep error: {e}")
         
-        # 3. Scanner avec Gitleaks (Secrets)
         if 'secrets' in scan_types:
             try:
                 result = subprocess.run(
@@ -514,11 +657,10 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
                             'file': f.get('File', '')[:200],
                             'line': f.get('StartLine', 0)
                         })
-                logger.info(f"   🔐 Gitleaks: {len(findings)} findings")
+                logger.info(f"   🔐 Gitleaks: {len([f for f in findings if f.get('scanner') == 'gitleaks'])} findings")
             except Exception as e:
                 logger.error(f"Gitleaks error: {e}")
         
-        # 4. Ajouter les findings à la base
         for finding in findings:
             finding_id = str(uuid.uuid4())
             cur.execute("""
@@ -534,7 +676,6 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
                 finding['file'], finding['line']
             ))
         
-        # 5. Mettre à jour le statut du scan ET le résumé
         cur.execute("""
             UPDATE scans 
             SET status = 'completed',
@@ -550,7 +691,6 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
         """, (scan_id, scan_id, scan_id, scan_id, scan_id, scan_id))
         conn.commit()
         
-        # Envoyer notification email si des findings critiques
         critical_findings = [f for f in findings if f['severity'] == 'critical']
         if critical_findings and email_notifier.enabled:
             recipients = os.getenv('ALERT_RECIPIENTS', '').split(',')
@@ -577,11 +717,18 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
 
 def run_scan_background(scan_id, repo_url, scan_types, tenant_id):
     """Wrapper synchrone pour exécuter le scan asynchrone"""
-    asyncio.run(run_scan_background_async(scan_id, repo_url, scan_types, tenant_id))
+    try:
+        # Create a new event loop for this thread
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        new_loop.run_until_complete(run_scan_background_async(scan_id, repo_url, scan_types, tenant_id))
+        new_loop.close()
+    except Exception as e:
+        logger.error(f"Background scan error: {e}")
 
 @app.route('/api/start-scan', methods=['POST'])
 def start_scan():
-    """Lancer un scan depuis le dashboard"""
+    """Lancer un scan depuis le dashboard - NON-BLOCKING VERSION"""
     try:
         data = request.json
         repo_url = data.get('repo_url')
@@ -590,7 +737,6 @@ def start_scan():
         
         logger.info(f"🚀 Starting scan for {repo_url}")
         
-        import uuid
         scan_id = str(uuid.uuid4())
         conn = get_db()
         cur = conn.cursor()
@@ -603,12 +749,15 @@ def start_scan():
         cur.close()
         conn.close()
         
-        # LANCER LE SCAN EN ARRIÈRE-PLAN
-        thread = threading.Thread(target=run_scan_background, args=(scan_id, repo_url, scan_types, tenant_id))
-        thread.daemon = True
+        # Run scan in background thread with its own event loop
+        thread = threading.Thread(
+            target=run_scan_background, 
+            args=(scan_id, repo_url, scan_types, tenant_id),
+            daemon=True
+        )
         thread.start()
         
-        return jsonify({'status': 'success', 'scan_id': scan_id})
+        return jsonify({'status': 'success', 'scan_id': scan_id, 'message': 'Scan started in background'})
         
     except Exception as e:
         logger.error(f"Error starting scan: {e}")
@@ -625,28 +774,24 @@ def generate_pdf_report(scan_id):
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # Récupérer les données du scan
         cur.execute("SELECT * FROM scans WHERE scan_id = %s", (scan_id,))
         scan = cur.fetchone()
         
         if not scan:
             return jsonify({'error': 'Scan non trouvé'}), 404
         
-        # Récupérer les findings
         cur.execute("""
             SELECT finding_id, title, description, severity, scanner_name, file_path, line_start
             FROM findings WHERE scan_id = %s
         """, (scan_id,))
         findings = cur.fetchall()
         
-        # Récupérer les informations du tenant
         cur.execute("SELECT * FROM tenants WHERE tenant_id = %s", (scan['tenant_id'],))
         tenant = cur.fetchone()
         
         cur.close()
         conn.close()
         
-        # Générer le PDF
         generator = PDFReportGenerator()
         pdf_buffer = generator.generate_report(
             scan_id=scan_id,
@@ -656,7 +801,6 @@ def generate_pdf_report(scan_id):
             tenant_info=tenant or {}
         )
         
-        # Retourner le PDF
         return Response(
             pdf_buffer.getvalue(),
             mimetype='application/pdf',
@@ -682,7 +826,6 @@ def get_scan_history():
         per_page = request.args.get('per_page', 20, type=int)
         offset = (page - 1) * per_page
         
-        # Récupérer les scans
         cur.execute("""
             SELECT scan_id, repo_url, status, created_at, completed_at, 
                    findings_summary, scan_types, metadata
@@ -692,7 +835,6 @@ def get_scan_history():
         """, (per_page, offset))
         scans = cur.fetchall()
         
-        # Récupérer le nombre total
         cur.execute("SELECT COUNT(*) FROM scans")
         total = cur.fetchone()['count']
         
@@ -718,7 +860,6 @@ def get_scan_stats():
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # Statistiques globales
         cur.execute("""
             SELECT 
                 COUNT(*) as total_scans,
@@ -730,7 +871,6 @@ def get_scan_stats():
         """)
         stats = cur.fetchone()
         
-        # Scans par jour (30 jours)
         cur.execute("""
             SELECT 
                 DATE(created_at) as date,
@@ -761,48 +901,89 @@ def filter_findings():
     """Filtrer les findings avec critères avancés"""
     try:
         conn = get_db()
+        if not conn:
+            return jsonify([])
+        
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        query = "SELECT * FROM findings WHERE 1=1"
+        query = """
+            SELECT 
+                finding_id::text, 
+                title, 
+                severity, 
+                scanner_name, 
+                finding_type, 
+                file_path, 
+                line_start, 
+                detected_at, 
+                status
+            FROM findings 
+            WHERE 1=1
+        """
         params = []
         param_count = 1
         
+        # Get filter parameters
         severity = request.args.get('severity')
-        if severity:
-            query += f" AND severity = ${param_count}"
-            params.append(severity)
-            param_count += 1
-        
         scanner = request.args.get('scanner')
-        if scanner:
-            query += f" AND scanner_name = ${param_count}"
-            params.append(scanner)
-            param_count += 1
-        
         status = request.args.get('status')
-        if status:
-            query += f" AND status = ${param_count}"
-            params.append(status)
-            param_count += 1
-        
         date_range = request.args.get('date_range')
+        search = request.args.get('search')
+        
+        # Apply filters (using exact lowercase matching)
+        if severity and severity != 'all':
+            query += f" AND severity = ${param_count}"
+            params.append(severity.lower())
+            param_count += 1
+            logger.info(f"Filtering by severity: {severity}")
+        
+        if scanner and scanner != 'all':
+            query += f" AND scanner_name = ${param_count}"
+            params.append(scanner.lower())
+            param_count += 1
+            logger.info(f"Filtering by scanner: {scanner}")
+        
+        if status and status != 'all':
+            query += f" AND status = ${param_count}"
+            params.append(status.lower())
+            param_count += 1
+            logger.info(f"Filtering by status: {status}")
+        
         if date_range == 'today':
             query += f" AND detected_at::date = CURRENT_DATE"
+            logger.info("Filtering by today")
         elif date_range == 'week':
             query += f" AND detected_at > NOW() - INTERVAL '7 days'"
+            logger.info("Filtering by last 7 days")
         elif date_range == 'month':
             query += f" AND detected_at > NOW() - INTERVAL '30 days'"
+            logger.info("Filtering by last 30 days")
         
-        search = request.args.get('search')
-        if search:
+        if search and search.strip():
             query += f" AND (title ILIKE $${param_count} OR description ILIKE $${param_count} OR file_path ILIKE $${param_count})"
             params.append(f"%{search}%")
             param_count += 1
+            logger.info(f"Filtering by search: {search}")
         
-        query += " ORDER BY severity DESC, detected_at DESC LIMIT 100"
+        # Order by severity (critical first, then high, etc.) and then by date
+        query += """
+            ORDER BY 
+                CASE severity
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    WHEN 'low' THEN 4
+                    ELSE 5
+                END, 
+                detected_at DESC 
+            LIMIT 100
+        """
         
+        logger.info(f"Filter query params: {params}")
         cur.execute(query, params)
         findings = cur.fetchall()
+        
+        logger.info(f"Filter returned {len(findings)} findings")
         
         cur.close()
         conn.close()
@@ -811,6 +992,8 @@ def filter_findings():
         
     except Exception as e:
         logger.error(f"Error filtering findings: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify([]), 500
 
 # ============ SCAN SCHEDULER ============
@@ -833,6 +1016,30 @@ def delete_scheduled_scan(scan_id):
     scan_scheduler.remove_scheduled_scan(scan_id)
     return jsonify({'status': 'success'})
 
+# ============ GRAFANA WEBHOOK ============
+
+@app.route('/api/webhooks/grafana', methods=['POST'])
+def grafana_webhook():
+    """Webhook endpoint for Grafana alerts"""
+    try:
+        data = request.json
+        logger.info(f"📨 Received Grafana alert: {data.get('title', 'Unknown')}")
+        
+        recipients = os.getenv('ALERT_RECIPIENTS', '').split(',')
+        
+        if recipients and email_notifier.enabled:
+            if data.get('alerts'):
+                for alert in data.get('alerts', []):
+                    asyncio.run_coroutine_threadsafe(
+                        email_notifier.send_grafana_alert(alert, recipients),
+                        loop
+                    )
+        
+        return jsonify({'status': 'ok', 'message': 'Webhook processed'}), 200
+    except Exception as e:
+        logger.error(f"Error processing Grafana webhook: {e}")
+        return jsonify({'error': str(e)}), 500
+
 # ============ STATISTIQUES EN TEMPS RÉEL ============
 
 @socketio.on('subscribe_stats')
@@ -840,7 +1047,6 @@ def handle_subscribe_stats():
     """S'abonner aux mises à jour des statistiques"""
     emit('stats_update', get_realtime_stats())
     
-    # Mettre à jour périodiquement
     def update_stats():
         import time
         while True:
@@ -858,18 +1064,15 @@ def get_realtime_stats():
         
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        # Dernier scan
         cur.execute("""
             SELECT scan_id, repo_url, status, created_at
             FROM scans ORDER BY created_at DESC LIMIT 1
         """)
         last_scan = cur.fetchone()
         
-        # Convert datetime to string for JSON serialization
         if last_scan and last_scan.get('created_at'):
             last_scan['created_at'] = last_scan['created_at'].isoformat()
         
-        # Statistiques des 5 dernières minutes
         cur.execute("""
             SELECT 
                 COUNT(*) as scans_5min,
@@ -879,7 +1082,6 @@ def get_realtime_stats():
         """)
         recent_stats = cur.fetchone()
         
-        # Vulnérabilités par sévérité
         cur.execute("""
             SELECT 
                 severity, COUNT(*) as count
@@ -916,6 +1118,11 @@ def handle_disconnect():
     """Handle client disconnection"""
     logger.info("Client disconnected from WebSocket")
 
+@socketio.on('ping')
+def handle_ping():
+    """Handle ping to keep connection alive"""
+    pass
+
 def broadcast_updates():
     """Broadcast updates to connected clients"""
     while True:
@@ -923,10 +1130,9 @@ def broadcast_updates():
         socketio.emit('refresh', {'data': 'Refresh dashboard'})
         logger.debug("Broadcast refresh signal")
 
-# Start background task
 socketio.start_background_task(broadcast_updates)
 
-# Démarrer le scan scheduler (CORRIGÉ - sans before_first_request)
+# Démarrer le scan scheduler
 try:
     scan_scheduler.start()
     logger.info("✅ Scan Scheduler started")
@@ -935,4 +1141,4 @@ except Exception as e:
 
 if __name__ == '__main__':
     logger.info("Starting dashboard server with REAL trend data...")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
