@@ -25,6 +25,7 @@ import asyncio
 from pdf_generator import PDFReportGenerator
 from email_notifier import EmailNotifier
 from scan_scheduler import ScanScheduler
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, REGISTRY
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -75,6 +76,14 @@ def get_db():
 def index():
     """Main dashboard"""
     return render_template('dashboard.html')
+
+@app.route('/metrics')
+def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(
+        generate_latest(REGISTRY),
+        mimetype=CONTENT_TYPE_LATEST
+    )
 
 @app.route('/api/health')
 def health():
@@ -718,7 +727,6 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
 def run_scan_background(scan_id, repo_url, scan_types, tenant_id):
     """Wrapper synchrone pour exécuter le scan asynchrone"""
     try:
-        # Create a new event loop for this thread
         new_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(new_loop)
         new_loop.run_until_complete(run_scan_background_async(scan_id, repo_url, scan_types, tenant_id))
@@ -749,7 +757,6 @@ def start_scan():
         cur.close()
         conn.close()
         
-        # Run scan in background thread with its own event loop
         thread = threading.Thread(
             target=run_scan_background, 
             args=(scan_id, repo_url, scan_types, tenant_id),
@@ -894,18 +901,20 @@ def get_scan_stats():
         logger.error(f"Error in scan stats: {e}")
         return jsonify({'error': str(e)}), 500
 
-# ============ FILTRES AVANCÉS ============
+# ============ FIXED FILTERS API ============
 
 @app.route('/api/findings/filter')
 def filter_findings():
-    """Filtrer les findings avec critères avancés"""
+    """Filtrer les findings avec critères avancés - VERSION COMPLETE FONCTIONNELLE"""
     try:
         conn = get_db()
         if not conn:
-            return jsonify([])
+            logger.error("No database connection for filter")
+            return jsonify({'error': 'Database connection failed'}), 500
         
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
+        # Base query
         query = """
             SELECT 
                 finding_id::text, 
@@ -916,12 +925,12 @@ def filter_findings():
                 file_path, 
                 line_start, 
                 detected_at, 
-                status
+                status,
+                description
             FROM findings 
             WHERE 1=1
         """
         params = []
-        param_count = 1
         
         # Get filter parameters
         severity = request.args.get('severity')
@@ -930,43 +939,44 @@ def filter_findings():
         date_range = request.args.get('date_range')
         search = request.args.get('search')
         
-        # Apply filters (using exact lowercase matching)
+        # Apply severity filter
         if severity and severity != 'all':
-            query += f" AND severity = ${param_count}"
+            query += " AND severity = %s"
             params.append(severity.lower())
-            param_count += 1
             logger.info(f"Filtering by severity: {severity}")
         
+        # Apply scanner filter
         if scanner and scanner != 'all':
-            query += f" AND scanner_name = ${param_count}"
+            query += " AND scanner_name = %s"
             params.append(scanner.lower())
-            param_count += 1
             logger.info(f"Filtering by scanner: {scanner}")
         
+        # Apply status filter
         if status and status != 'all':
-            query += f" AND status = ${param_count}"
+            query += " AND status = %s"
             params.append(status.lower())
-            param_count += 1
             logger.info(f"Filtering by status: {status}")
         
+        # Apply date range filter
         if date_range == 'today':
-            query += f" AND detected_at::date = CURRENT_DATE"
+            query += " AND detected_at::date = CURRENT_DATE"
             logger.info("Filtering by today")
         elif date_range == 'week':
-            query += f" AND detected_at > NOW() - INTERVAL '7 days'"
+            query += " AND detected_at > NOW() - INTERVAL '7 days'"
             logger.info("Filtering by last 7 days")
         elif date_range == 'month':
-            query += f" AND detected_at > NOW() - INTERVAL '30 days'"
+            query += " AND detected_at > NOW() - INTERVAL '30 days'"
             logger.info("Filtering by last 30 days")
         
+        # Apply search filter
         if search and search.strip():
-            query += f" AND (title ILIKE $${param_count} OR description ILIKE $${param_count} OR file_path ILIKE $${param_count})"
-            params.append(f"%{search}%")
-            param_count += 1
+            query += " AND (title ILIKE %s OR description ILIKE %s OR file_path ILIKE %s)"
+            search_param = f"%{search.strip()}%"
+            params.extend([search_param, search_param, search_param])
             logger.info(f"Filtering by search: {search}")
         
-        # Order by severity (critical first, then high, etc.) and then by date
-        query += """
+        # Add ORDER BY and LIMIT
+        query += """ 
             ORDER BY 
                 CASE severity
                     WHEN 'critical' THEN 1
@@ -979,22 +989,28 @@ def filter_findings():
             LIMIT 100
         """
         
-        logger.info(f"Filter query params: {params}")
+        logger.info(f"Filter query: {query}")
+        logger.info(f"Filter params: {params}")
+        
         cur.execute(query, params)
         findings = cur.fetchall()
         
-        logger.info(f"Filter returned {len(findings)} findings")
+        # Convert datetime objects to ISO format for JSON serialization
+        for finding in findings:
+            if finding.get('detected_at'):
+                finding['detected_at'] = finding['detected_at'].isoformat()
         
         cur.close()
         conn.close()
         
+        logger.info(f"Filter returned {len(findings)} findings")
         return jsonify(findings)
         
     except Exception as e:
-        logger.error(f"Error filtering findings: {e}")
+        logger.error(f"Error filtering findings: {str(e)}")
         import traceback
         traceback.print_exc()
-        return jsonify([]), 500
+        return jsonify({'error': str(e)}), 500
 
 # ============ SCAN SCHEDULER ============
 

@@ -1,30 +1,120 @@
 groups:
   - name: security_alerts
+    interval: 30s
     rules:
+      # High number of critical findings
       - alert: HighCriticalFindings
-        expr: sum(scan_critical_findings) > 10
-        for: 1h
+        expr: sum(findings_total{severity="critical"}) > 5
+        for: 5m
+        labels:
+          severity: critical
+          team: security
         annotations:
           summary: "High number of critical findings detected"
-          description: "There are {{ $value }} critical findings across all scans"
+          description: "There are {{ $value }} critical findings across all scans. Immediate action required."
 
+      # Scan failure rate too high
       - alert: ScanFailureRate
-        expr: rate(scan_failures_total[1h]) > 0.1
-        for: 15m
+        expr: |
+          (sum(rate(scans_total{status="failed"}[15m])) / 
+           sum(rate(scans_total[15m]))) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
         annotations:
           summary: "High scan failure rate"
-          description: "Scan failure rate is {{ $value }}%"
+          description: "Scan failure rate is {{ $value | humanizePercentage }}. Check orchestrator logs."
 
-      - alert: RemediationSLABreach
-        expr: time() - finding_last_updated{severity="critical"} > 86400
-        for: 1h
-        annotations:
-          summary: "Critical finding remediation SLA breached"
-          description: "Critical finding {{ $labels.finding_id }} is older than 24 hours"
-
-      - alert: ComplianceScoreDrop
-        expr: compliance_score < 80
+      # No active scans (possible downtime)
+      - alert: NoActiveScans
+        expr: sum(active_scans) == 0
         for: 30m
+        labels:
+          severity: info
+          team: platform
         annotations:
-          summary: "Compliance score dropped below threshold"
-          description: "Compliance score is {{ $value }}%"
+          summary: "No active scans for 30 minutes"
+          description: "No security scans have been running. This might indicate system idle or issues."
+
+      # Critical findings detected in last 5 minutes
+      - alert: CriticalFindingsDetected
+        expr: increase(findings_total{severity="critical"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: security
+        annotations:
+          summary: "New critical vulnerability detected"
+          description: "{{ $value }} new critical finding(s) detected in the last 5 minutes. Review immediately."
+
+      # Scan taking too long
+      - alert: ScanTakingTooLong
+        expr: scan_duration_seconds > 600
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Scan taking too long"
+          description: "Scan has been running for {{ $value }} seconds (>10 minutes)."
+
+      # High API error rate
+      - alert: HighAPIErrorRate
+        expr: |
+          (sum(rate(api_requests_total{status_code=~"5.."}[5m])) / 
+           sum(rate(api_requests_total[5m]))) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "High API error rate"
+          description: "API error rate is {{ $value | humanizePercentage }}. Check API gateway logs."
+
+      # Slow API responses
+      - alert: SlowAPIResponses
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(api_request_duration_seconds_bucket[5m])) by (le)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "API response time degraded"
+          description: "95th percentile response time is {{ $value }}s. Performance issue detected."
+
+      # High number of high severity findings
+      - alert: HighSeverityFindings
+        expr: sum(findings_total{severity="high"}) > 20
+        for: 15m
+        labels:
+          severity: warning
+          team: security
+        annotations:
+          summary: "High number of high severity findings"
+          description: "There are {{ $value }} high severity findings. Plan remediation within 72 hours."
+
+      # Tenant scan limit approaching
+      - alert: TenantScanLimitApproaching
+        expr: sum(active_scans) by (tenant_id) > 4
+        for: 1m
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: "Tenant scan limit approaching"
+          description: "Tenant {{ $labels.tenant_id }} has {{ $value }} active scans (limit 5)."
+
+      # Scans per minute drop (possible issues)
+      - alert: ScanRateDropped
+        expr: rate(scans_total[5m]) < 0.1
+        for: 10m
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: "Scan rate dropped significantly"
+          description: "Scan rate is {{ $value }} scans per minute. Expected normal activity."

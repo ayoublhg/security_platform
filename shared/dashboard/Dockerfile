@@ -45,7 +45,8 @@ RUN pip install --no-cache-dir \
     matplotlib==3.7.2 \
     seaborn==0.12.2 \
     apscheduler==3.10.4 \
-    psutil==5.9.6
+    psutil==5.9.6 \
+    prometheus-client==0.19.0
 
 # Verify installations
 RUN semgrep --version && \

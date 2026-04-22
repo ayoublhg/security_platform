@@ -149,6 +149,16 @@ class SecurityOrchestrator:
         self.resource_semaphores[config.tenant_id] = asyncio.Semaphore(config.max_concurrent_scans)
         logger.info(f"Registered tenant: {config.name} ({config.tenant_id})")
     
+    async def ensure_scan_record(self, scan_id: str, request: ScanRequest):
+        """Ensure scan record exists before saving findings - FIXES FOREIGN KEY ERROR"""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO scans (scan_id, tenant_id, repo_url, status, created_at)
+                VALUES ($1, $2, $3, 'running', NOW())
+                ON CONFLICT (scan_id) DO NOTHING
+            """, scan_id, request.tenant_id, request.repo_url)
+            logger.info(f"📝 Scan record ensured for {scan_id}")
+    
     async def submit_scan(self, request: ScanRequest) -> str:
         if request.tenant_id not in self.tenants:
             default_config = TenantConfig(
@@ -171,6 +181,9 @@ class SecurityOrchestrator:
         self.active_scans[scan_id] = scan
         await self.scan_queue.put((scan_id, request))
         await self.redis.setex(f"scan:{scan_id}", 3600, scan.json())
+        
+        # Create scan record in database immediately
+        await self.ensure_scan_record(scan_id, request)
         
         for scan_type in request.scan_types:
             scans_total.labels(status="queued", tenant_id=request.tenant_id, scan_type=scan_type.value).inc()
@@ -308,6 +321,15 @@ class SecurityOrchestrator:
         logger.info(f"Starting scan {scan_id}")
         start_time = time.time()
         
+        # Update scan status to running
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE scans 
+                SET status = 'running', 
+                    start_time = NOW()
+                WHERE scan_id = $1
+            """, scan_id)
+        
         self.active_scans[scan_id].status = "running"
         await self.redis.set(f"scan:{scan_id}:status", "running")
         
@@ -398,14 +420,27 @@ class SecurityOrchestrator:
             
             summary['total'] = len(findings)
             
+            # Save findings to database
             await self.save_findings(scan_id, request.tenant_id, findings)
             
+            # Update scan metrics
             for scan_type in request.scan_types:
                 scans_total.labels(status="completed", tenant_id=request.tenant_id, scan_type=scan_type.value).inc()
             
             total_duration = time.time() - start_time
             for scan_type in request.scan_types:
                 scan_duration_seconds.labels(scan_type=scan_type.value, tenant_id=request.tenant_id).observe(total_duration)
+            
+            # Update scan status to completed
+            async with self.pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE scans 
+                    SET status = 'completed',
+                        end_time = NOW(),
+                        completed_at = NOW(),
+                        duration_seconds = $2
+                    WHERE scan_id = $1
+                """, scan_id, int(total_duration))
             
             scan = self.active_scans[scan_id]
             scan.status = "completed"
@@ -424,6 +459,16 @@ class SecurityOrchestrator:
                 scan.end_time = datetime.utcnow()
                 scan.metadata['error'] = str(e)
                 await self.store_results(scan)
+                
+                # Update scan status to failed
+                async with self.pool.acquire() as conn:
+                    await conn.execute("""
+                        UPDATE scans 
+                        SET status = 'failed',
+                            end_time = NOW(),
+                            error_message = $2
+                        WHERE scan_id = $1
+                    """, scan_id, str(e))
         finally:
             active_scans.labels(tenant_id=request.tenant_id).dec()
             if repo_path:
@@ -435,8 +480,11 @@ class SecurityOrchestrator:
                 INSERT INTO scans (scan_id, tenant_id, repo_url, start_time, end_time, status, findings, summary, metadata)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (scan_id) DO UPDATE SET
-                    status = EXCLUDED.status, end_time = EXCLUDED.end_time,
-                    findings = EXCLUDED.findings, summary = EXCLUDED.summary
+                    status = EXCLUDED.status, 
+                    end_time = EXCLUDED.end_time,
+                    findings = EXCLUDED.findings, 
+                    summary = EXCLUDED.summary,
+                    metadata = EXCLUDED.metadata
             """, scan.scan_id, scan.tenant_id, scan.repo_url,
                 scan.start_time, scan.end_time, scan.status,
                 json.dumps(scan.findings), json.dumps(scan.summary), json.dumps(scan.metadata))
@@ -487,8 +535,10 @@ async def register_tenant(config: TenantConfig):
                     webhook_url, slack_channel, jira_project, compliance_frameworks, active)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (tenant_id) DO UPDATE SET
-                    name = EXCLUDED.name, max_concurrent = EXCLUDED.max_concurrent,
-                    allowed_scanners = EXCLUDED.allowed_scanners, active = EXCLUDED.active
+                    name = EXCLUDED.name, 
+                    max_concurrent = EXCLUDED.max_concurrent,
+                    allowed_scanners = EXCLUDED.allowed_scanners, 
+                    active = EXCLUDED.active
             """, config.tenant_id, config.name, config.max_concurrent_scans,
                 [s.value for s in config.allowed_scanners],
                 config.webhook_url, config.slack_channel, config.jira_project,

@@ -1,3 +1,4 @@
+version: '3.8'
 
 services:
   # ============ SERVICES DE BASE ============
@@ -38,6 +39,35 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ============ EXPORTERS POUR MONITORING ============
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: security-postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-secure_password}@postgres:5432/${POSTGRES_DB:-security_platform}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    networks:
+      - security-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    container_name: security-redis-exporter
+    environment:
+      REDIS_ADDR: "redis:6379"
+    ports:
+      - "9121:9121"
+    networks:
+      - security-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ============ SERVICES PLATEFORME ============
   orchestrator:
     build: ./platform/orchestrator
@@ -45,8 +75,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - REDIS_URL=redis://redis:6379
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_password}
+      - POSTGRES_DB=${POSTGRES_DB:-security_platform}
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - GITLAB_TOKEN=${GITLAB_TOKEN}
     volumes:
@@ -68,7 +101,7 @@ services:
       - "8080:8080"
     environment:
       - JWT_SECRET=${JWT_SECRET:-dev_secret_key_change_in_production}
-      - REDIS_URL=redis://redis:6379
+      - REDIS_HOST=redis
     depends_on:
       - redis
       - orchestrator
@@ -83,8 +116,11 @@ services:
     ports:
       - "8001:8001"
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      - REDIS_URL=redis://redis:6379
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_password}
+      - POSTGRES_DB=${POSTGRES_DB:-security_platform}
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
       - NVD_API_KEY=${NVD_API_KEY}
     depends_on:
       - postgres
@@ -99,7 +135,10 @@ services:
     ports:
       - "8002:8002"
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_password}
+      - POSTGRES_DB=${POSTGRES_DB:-security_platform}
+      - POSTGRES_HOST=postgres
     depends_on:
       - postgres
     networks:
@@ -109,12 +148,16 @@ services:
   auto-remediation:
     build: ./security/auto-remediation
     container_name: security-remediation
+    ports:
+      - "8003:8003"
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - JIRA_URL=${JIRA_URL}
       - JIRA_USER=${JIRA_USER}
       - JIRA_TOKEN=${JIRA_TOKEN}
       - SLACK_TOKEN=${SLACK_TOKEN}
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
     depends_on:
       - postgres
       - redis
@@ -129,7 +172,11 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_password}
+      - POSTGRES_DB=${POSTGRES_DB:-security_platform}
+      - POSTGRES_HOST=postgres
+      - REDIS_HOST=redis
       - ORCHESTRATOR_API=http://orchestrator:8000
     depends_on:
       - postgres
@@ -145,8 +192,13 @@ services:
     ports:
       - "9090:9090"
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
     networks:
       - security-network
     restart: unless-stopped
@@ -159,9 +211,10 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
     depends_on:
       - prometheus
     networks:
