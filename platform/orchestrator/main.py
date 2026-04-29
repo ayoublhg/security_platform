@@ -154,10 +154,41 @@ class SecurityOrchestrator:
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO scans (scan_id, tenant_id, repo_url, status, created_at)
-                VALUES ($1, $2, $3, 'running', NOW())
+                VALUES ($1, $2, $3, 'queued', NOW())
                 ON CONFLICT (scan_id) DO NOTHING
             """, scan_id, request.tenant_id, request.repo_url)
             logger.info(f"📝 Scan record ensured for {scan_id}")
+    
+    async def clone_repository(self, repo_url: str, repo_path: str) -> bool:
+        """Clone repository with proper error handling and authentication"""
+        try:
+            # Configure git to avoid interactive prompts
+            env = os.environ.copy()
+            env['GIT_TERMINAL_PROMPT'] = '0'
+            env['GIT_ASKPASS'] = 'echo'
+            
+            # Add GitHub token if available for private repos
+            github_token = os.getenv('GITHUB_TOKEN')
+            clone_url = repo_url
+            if github_token and 'github.com' in repo_url:
+                clone_url = repo_url.replace('https://', f'https://{github_token}@')
+                logger.info("Using GitHub token for authentication")
+            
+            clone_result = subprocess.run(
+                ["git", "-c", "advice.detachedHead=false", "clone", "--depth", "1", clone_url, repo_path],
+                capture_output=True, text=True, timeout=120, env=env
+            )
+            if clone_result.returncode != 0:
+                logger.error(f"Clone failed: {clone_result.stderr}")
+                return False
+            logger.info(f"📁 Repository cloned successfully to {repo_path}")
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error("Clone timeout after 120 seconds")
+            return False
+        except Exception as e:
+            logger.error(f"Clone error: {e}")
+            return False
     
     async def submit_scan(self, request: ScanRequest) -> str:
         if request.tenant_id not in self.tenants:
@@ -238,8 +269,14 @@ class SecurityOrchestrator:
         """Scan with Trivy for container and filesystem vulnerabilities"""
         logger.info("   🐳 Running Trivy filesystem scan...")
         try:
+            # Check if trivy is installed
+            check = subprocess.run(["which", "trivy"], capture_output=True, text=True)
+            if check.returncode != 0:
+                logger.warning("   ⚠️ Trivy not installed, skipping container scan")
+                return
+            
             result = subprocess.run(
-                ["trivy", "fs", "--format", "json", "--severity", "CRITICAL,HIGH,MEDIUM,LOW", repo_path],
+                ["trivy", "fs", "--format", "json", "--severity", "CRITICAL,HIGH,MEDIUM,LOW", "--quiet", repo_path],
                 capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
             )
             if result.stdout:
@@ -259,13 +296,23 @@ class SecurityOrchestrator:
                         summary[severity] = summary.get(severity, 0) + 1
                         findings_total.labels(severity=severity, scanner='trivy', tenant_id=tenant_id).inc()
             logger.info(f"   🐳 Trivy: {len([f for f in findings if f.get('scanner') == 'trivy'])} findings")
+        except json.JSONDecodeError:
+            logger.warning("   ⚠️ Trivy output not valid JSON")
+        except subprocess.TimeoutExpired:
+            logger.warning("   ⚠️ Trivy scan timeout")
         except Exception as e:
-            logger.error(f"Trivy error: {e}")
+            logger.error(f"   ❌ Trivy error: {e}")
     
     async def scan_with_checkov(self, repo_path: str, findings: List, summary: Dict, tenant_id: str):
         """Scan with Checkov for IaC misconfigurations"""
         logger.info("   🏗️ Running Checkov IaC scan...")
         try:
+            # Check if checkov is installed
+            check = subprocess.run(["which", "checkov"], capture_output=True, text=True)
+            if check.returncode != 0:
+                logger.warning("   ⚠️ Checkov not installed, skipping IaC scan")
+                return
+            
             result = subprocess.run(
                 ["checkov", "-d", repo_path, "--output", "json", "--quiet"],
                 capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
@@ -287,14 +334,20 @@ class SecurityOrchestrator:
                     findings_total.labels(severity=severity, scanner='checkov', tenant_id=tenant_id).inc()
             logger.info(f"   🏗️ Checkov: {len([f for f in findings if f.get('scanner') == 'checkov'])} findings")
         except Exception as e:
-            logger.error(f"Checkov error: {e}")
+            logger.error(f"   ❌ Checkov error: {e}")
     
     async def scan_with_dependency_check(self, repo_path: str, findings: List, summary: Dict, tenant_id: str):
         """Scan with OWASP Dependency Check for vulnerable dependencies"""
         logger.info("   📦 Running OWASP Dependency Check...")
         try:
+            # Check if dependency-check is installed
+            check = subprocess.run(["which", "dependency-check"], capture_output=True, text=True)
+            if check.returncode != 0:
+                logger.warning("   ⚠️ OWASP Dependency Check not installed, skipping SCA scan")
+                return
+            
             result = subprocess.run(
-                ["dependency-check", "--scan", repo_path, "--format", "JSON", "--pretty"],
+                ["dependency-check", "--scan", repo_path, "--format", "JSON", "--pretty", "--noupdate"],
                 capture_output=True, text=True, timeout=600, encoding='utf-8', errors='ignore'
             )
             if result.stdout:
@@ -315,7 +368,66 @@ class SecurityOrchestrator:
                         findings_total.labels(severity=severity, scanner='dependency-check', tenant_id=tenant_id).inc()
             logger.info(f"   📦 OWASP DC: {len([f for f in findings if f.get('scanner') == 'dependency-check'])} findings")
         except Exception as e:
-            logger.error(f"Dependency check error: {e}")
+            logger.error(f"   ❌ OWASP DC error: {e}")
+    
+    async def scan_with_semgrep(self, repo_path: str, findings: List, summary: Dict, tenant_id: str):
+        """Scan with Semgrep for SAST vulnerabilities"""
+        logger.info("   🔍 Running Semgrep SAST scan...")
+        try:
+            result = subprocess.run(
+                ["semgrep", "--config", "auto", "--json", "--quiet", repo_path],
+                capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+            )
+            if result.stdout:
+                data = json.loads(result.stdout)
+                for r in data.get('results', []):
+                    severity_raw = r.get('extra', {}).get('severity', 'medium').lower()
+                    severity_map = {'error': 'high', 'warning': 'medium', 'note': 'low'}
+                    severity = severity_map.get(severity_raw, severity_raw)
+                    if severity not in ['critical', 'high', 'medium', 'low', 'info']:
+                        severity = 'medium'
+                    
+                    findings.append({
+                        'title': r.get('check_id', 'Unknown')[:200],
+                        'description': r.get('extra', {}).get('message', '')[:500],
+                        'severity': severity,
+                        'scanner': 'semgrep',
+                        'type': 'sast',
+                        'file': r.get('path', '')[:200],
+                        'line': r.get('start', {}).get('line', 0)
+                    })
+                    summary[severity] = summary.get(severity, 0) + 1
+                    findings_total.labels(severity=severity, scanner='semgrep', tenant_id=tenant_id).inc()
+            logger.info(f"   🔍 Semgrep: {len([f for f in findings if f.get('scanner') == 'semgrep'])} findings")
+        except Exception as e:
+            logger.error(f"   ❌ Semgrep error: {e}")
+    
+    async def scan_with_gitleaks(self, repo_path: str, findings: List, summary: Dict, tenant_id: str):
+        """Scan with Gitleaks for secrets"""
+        logger.info("   🔐 Running Gitleaks secrets scan...")
+        try:
+            result = subprocess.run(
+                ["gitleaks", "detect", "--source", repo_path, "--report-format", "json", "--no-git", "--verbose"],
+                capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
+            )
+            if result.stdout:
+                data = json.loads(result.stdout)
+                items = data if isinstance(data, list) else data.get('findings', [])
+                for f in items:
+                    findings.append({
+                        'title': f"Secret: {f.get('RuleID', 'unknown')}"[:200],
+                        'description': f.get('Description', '')[:500],
+                        'severity': 'critical',
+                        'scanner': 'gitleaks',
+                        'type': 'secret',
+                        'file': f.get('File', '')[:200],
+                        'line': f.get('StartLine', 0)
+                    })
+                    summary['critical'] = summary.get('critical', 0) + 1
+                    findings_total.labels(severity='critical', scanner='gitleaks', tenant_id=tenant_id).inc()
+            logger.info(f"   🔐 Gitleaks: {len([f for f in findings if f.get('scanner') == 'gitleaks'])} findings")
+        except Exception as e:
+            logger.error(f"   ❌ Gitleaks error: {e}")
     
     async def execute_scan(self, scan_id: str, request: ScanRequest):
         logger.info(f"Starting scan {scan_id}")
@@ -340,88 +452,33 @@ class SecurityOrchestrator:
         repo_path = None
         
         try:
+            # Create temp directory and clone repository
             repo_path = tempfile.mkdtemp()
-            clone_result = subprocess.run(
-                ["git", "clone", "--depth", "1", request.repo_url, repo_path],
-                capture_output=True, text=True, timeout=120
-            )
-            if clone_result.returncode != 0:
-                raise Exception(f"Failed to clone: {clone_result.stderr}")
-            logger.info(f"📁 Repository cloned to {repo_path}")
+            clone_success = await self.clone_repository(request.repo_url, repo_path)
+            if not clone_success:
+                raise Exception("Failed to clone repository - check if URL is correct and repository is public")
             
-            # SAST with Semgrep
+            # Run scanners based on scan_types
             if ScanType.SAST in request.scan_types:
-                try:
-                    result = subprocess.run(
-                        ["semgrep", "--config", "auto", "--json", repo_path],
-                        capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
-                    )
-                    if result.stdout:
-                        data = json.loads(result.stdout)
-                        for r in data.get('results', []):
-                            severity_raw = r.get('extra', {}).get('severity', 'medium').lower()
-                            severity_map = {'error': 'high', 'warning': 'medium', 'note': 'low'}
-                            severity = severity_map.get(severity_raw, severity_raw)
-                            if severity not in ['critical', 'high', 'medium', 'low', 'info']:
-                                severity = 'medium'
-                            
-                            findings.append({
-                                'title': r.get('check_id', 'Unknown')[:200],
-                                'description': r.get('extra', {}).get('message', '')[:500],
-                                'severity': severity,
-                                'scanner': 'semgrep',
-                                'type': 'sast',
-                                'file': r.get('path', '')[:200],
-                                'line': r.get('start', {}).get('line', 0)
-                            })
-                            summary[severity] = summary.get(severity, 0) + 1
-                            findings_total.labels(severity=severity, scanner='semgrep', tenant_id=request.tenant_id).inc()
-                    logger.info(f"   🔍 Semgrep: {len([f for f in findings if f.get('scanner') == 'semgrep'])} findings")
-                except Exception as e:
-                    logger.error(f"Semgrep error: {e}")
+                await self.scan_with_semgrep(repo_path, findings, summary, request.tenant_id)
             
-            # Secrets with Gitleaks
             if ScanType.SECRETS in request.scan_types:
-                try:
-                    result = subprocess.run(
-                        ["gitleaks", "detect", "--source", repo_path, "--report-format", "json", "--no-git"],
-                        capture_output=True, text=True, timeout=300, encoding='utf-8', errors='ignore'
-                    )
-                    if result.stdout:
-                        data = json.loads(result.stdout)
-                        items = data if isinstance(data, list) else data.get('findings', [])
-                        for f in items:
-                            findings.append({
-                                'title': f"Secret: {f.get('RuleID', 'unknown')}"[:200],
-                                'description': f.get('Description', '')[:500],
-                                'severity': 'critical',
-                                'scanner': 'gitleaks',
-                                'type': 'secret',
-                                'file': f.get('File', '')[:200],
-                                'line': f.get('StartLine', 0)
-                            })
-                            summary['critical'] += 1
-                            findings_total.labels(severity='critical', scanner='gitleaks', tenant_id=request.tenant_id).inc()
-                    logger.info(f"   🔐 Gitleaks: {len([f for f in findings if f.get('scanner') == 'gitleaks'])} findings")
-                except Exception as e:
-                    logger.error(f"Gitleaks error: {e}")
+                await self.scan_with_gitleaks(repo_path, findings, summary, request.tenant_id)
             
-            # Container with Trivy
             if ScanType.CONTAINER in request.scan_types:
                 await self.scan_with_trivy(repo_path, findings, summary, request.tenant_id)
             
-            # IaC with Checkov
             if ScanType.IAC in request.scan_types:
                 await self.scan_with_checkov(repo_path, findings, summary, request.tenant_id)
             
-            # SCA with OWASP Dependency Check
             if ScanType.SCA in request.scan_types:
                 await self.scan_with_dependency_check(repo_path, findings, summary, request.tenant_id)
             
             summary['total'] = len(findings)
             
             # Save findings to database
-            await self.save_findings(scan_id, request.tenant_id, findings)
+            if findings:
+                await self.save_findings(scan_id, request.tenant_id, findings)
             
             # Update scan metrics
             for scan_type in request.scan_types:

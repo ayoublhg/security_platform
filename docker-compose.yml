@@ -171,6 +171,8 @@ services:
     container_name: security-dashboard
     ports:
       - "5000:5000"
+    env_file:
+      - .env
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_password}

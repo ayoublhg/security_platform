@@ -89,6 +89,32 @@ def metrics():
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
+@app.route('/api/test-email')
+def test_email():
+    """Test email notification endpoint"""
+    if not email_notifier.enabled:
+        return jsonify({'error': 'Email notifier disabled - check SMTP credentials'}), 400
+    
+    recipients = os.getenv('ALERT_RECIPIENTS', '').split(',')
+    if not recipients or not recipients[0]:
+        return jsonify({'error': 'No recipients configured'}), 400
+    
+    test_finding = {
+        'title': 'TEST - Email Notification System',
+        'description': 'This is a test email to verify that email notifications are working correctly on the Enterprise Security Platform.',
+        'severity': 'info',
+        'scanner': 'test',
+        'file': 'test.py',
+        'line': 42
+    }
+    
+    asyncio.run_coroutine_threadsafe(
+        email_notifier.send_critical_alert(test_finding, 'default', recipients),
+        loop
+    )
+    
+    return jsonify({'status': 'success', 'message': f'Test email sent to {", ".join(recipients)}'})
+
 @app.route('/api/scanners')
 def get_scanners():
     """Get list of scanners that have findings in the database"""
@@ -246,9 +272,10 @@ def add_finding_v1():
         cur.close()
         conn.close()
         
+        # Send email alert for critical findings
         if data.get('severity') == 'critical' and email_notifier.enabled:
             recipients = os.getenv('ALERT_RECIPIENTS', '').split(',')
-            if recipients:
+            if recipients and recipients[0]:
                 finding = {
                     'title': data.get('title', ''),
                     'description': data.get('description', ''),
@@ -261,6 +288,7 @@ def add_finding_v1():
                     email_notifier.send_critical_alert(finding, data.get('tenant_id', 'default'), recipients),
                     loop
                 )
+                logger.info(f"📧 Critical alert email sent for finding: {data.get('title', '')[:50]}")
         
         logger.info(f"✅ Finding added: {data.get('title', '')[:50]}")
         return jsonify({'status': 'success'}), 201
@@ -700,12 +728,19 @@ async def run_scan_background_async(scan_id, repo_url, scan_types, tenant_id):
         """, (scan_id, scan_id, scan_id, scan_id, scan_id, scan_id))
         conn.commit()
         
-        critical_findings = [f for f in findings if f['severity'] == 'critical']
-        if critical_findings and email_notifier.enabled:
+        # Send email summary for completed scan
+        if findings and email_notifier.enabled:
             recipients = os.getenv('ALERT_RECIPIENTS', '').split(',')
-            if recipients:
-                for finding in critical_findings[:5]:
-                    await email_notifier.send_critical_alert(finding, tenant_id, recipients)
+            if recipients and recipients[0]:
+                summary = {
+                    'critical': sum(1 for f in findings if f.get('severity') == 'critical'),
+                    'high': sum(1 for f in findings if f.get('severity') == 'high'),
+                    'medium': sum(1 for f in findings if f.get('severity') == 'medium'),
+                    'low': sum(1 for f in findings if f.get('severity') == 'low'),
+                    'total': len(findings)
+                }
+                await email_notifier.send_scan_complete(scan_id, repo_url, summary, recipients)
+                logger.info(f"📧 Scan completion email sent for {scan_id}")
         
         logger.info(f"✅ Scan {scan_id} completed with {len(findings)} findings")
         
@@ -1043,13 +1078,14 @@ def grafana_webhook():
         
         recipients = os.getenv('ALERT_RECIPIENTS', '').split(',')
         
-        if recipients and email_notifier.enabled:
+        if recipients and recipients[0] and email_notifier.enabled:
             if data.get('alerts'):
                 for alert in data.get('alerts', []):
                     asyncio.run_coroutine_threadsafe(
                         email_notifier.send_grafana_alert(alert, recipients),
                         loop
                     )
+                    logger.info(f"📧 Grafana alert email sent for: {alert.get('labels', {}).get('alertname', 'Unknown')}")
         
         return jsonify({'status': 'ok', 'message': 'Webhook processed'}), 200
     except Exception as e:
