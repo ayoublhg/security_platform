@@ -10,7 +10,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-security_platform}
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./shared/database/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -27,7 +27,7 @@ services:
     image: redis:7-alpine
     container_name: security-redis
     ports:
-      - "6379:6379"
+      - "16379:6379"
     volumes:
       - redis-data:/data
     networks:
@@ -46,7 +46,7 @@ services:
     environment:
       DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-secure_password}@postgres:5432/${POSTGRES_DB:-security_platform}?sslmode=disable"
     ports:
-      - "9187:9187"
+      - "19187:9187"
     networks:
       - security-network
     depends_on:
@@ -60,7 +60,7 @@ services:
     environment:
       REDIS_ADDR: "redis:6379"
     ports:
-      - "9121:9121"
+      - "19121:9121"
     networks:
       - security-network
     depends_on:
@@ -73,7 +73,7 @@ services:
     build: ./platform/orchestrator
     container_name: security-orchestrator
     ports:
-      - "8000:8000"
+      - "18000:8000"
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_password}
@@ -98,7 +98,7 @@ services:
     build: ./platform/api-gateway
     container_name: security-api-gateway
     ports:
-      - "8080:8080"
+      - "18080:8080"
     environment:
       - JWT_SECRET=${JWT_SECRET:-dev_secret_key_change_in_production}
       - REDIS_HOST=redis
@@ -114,7 +114,7 @@ services:
     build: ./security/vuln-database
     container_name: security-vuln-db
     ports:
-      - "8001:8001"
+      - "18001:8001"
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_password}
@@ -133,7 +133,7 @@ services:
     build: ./security/compliance-mapper
     container_name: security-compliance
     ports:
-      - "8002:8002"
+      - "18002:8002"
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_password}
@@ -149,7 +149,7 @@ services:
     build: ./security/auto-remediation
     container_name: security-remediation
     ports:
-      - "8003:8003"
+      - "18003:8003"
     environment:
       - GITHUB_TOKEN=${GITHUB_TOKEN}
       - JIRA_URL=${JIRA_URL}
@@ -170,7 +170,7 @@ services:
     build: ./shared/dashboard
     container_name: security-dashboard
     ports:
-      - "5000:5000"
+      - "15000:5000"
     env_file:
       - .env
     environment:
@@ -192,7 +192,7 @@ services:
     image: prom/prometheus:latest
     container_name: security-prometheus
     ports:
-      - "9090:9090"
+      - "19090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -209,7 +209,7 @@ services:
     image: grafana/grafana:latest
     container_name: security-grafana
     ports:
-      - "3000:3000"
+      - "13000:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
